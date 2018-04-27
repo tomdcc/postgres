@@ -189,6 +189,25 @@ LOAD 'auto_explain';
 
    <varlistentry>
     <term>
+     <varname>auto_explain.log_destination</varname> (<type>enum</type>)
+     <indexterm>
+      <primary><varname>auto_explain.log_destination</> configuration parameter</primary>
+     </indexterm>
+    </term>
+    <listitem>
+     <para>
+      <varname>auto_explain.log_destination</varname> selects where
+      auto_explain will log the query plan.
+      The allowed values are <literal>log</literal>, which logs the plan to the
+      server log, and <literal>notice</literal>, which logs it as a NOTICE, which
+      allows clients to access it. <literal>log</literal> is the default.
+      Only superusers can change this setting.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term>
      <varname>auto_explain.log_nested_statements</varname> (<type>boolean</type>)
      <indexterm>
       <primary><varname>auto_explain.log_nested_statements</varname> configuration parameter</primary>
