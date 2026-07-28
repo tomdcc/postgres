@@ -1744,6 +1744,13 @@ CREATE DATABASE foo WITH TEMPLATE template0;
    restore process and prevent potential conflicts with
    non-default <application>psql</application> configurations.
   </para>
+
+  <para>
+   An index created with
+   <link linkend="sql-createindex-with-no-data"><command>CREATE INDEX ... WITH
+   NO DATA</command></link> is dumped with that clause, so restoring the dump
+   does not build it.
+  </para>
  </refsect1>
 
  <refsect1 id="pg-dump-examples" xreflabel="Examples">

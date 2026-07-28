@@ -7913,6 +7913,18 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 	 */
 	if (fout->remoteVersion >= 110000)
 	{
+		/*
+		 * An index created WITH NO DATA has neither indisvalid nor
+		 * indisready, so it must bypass both conjuncts to be dumped at all.
+		 * Unlike an invalid index -- which is a crash artifact of unknown
+		 * provenance, and is deliberately omitted -- it is a definition the
+		 * user asked for, so it belongs in the dump.
+		 *
+		 * Require indislive along with it.  Bypassing indisvalid and
+		 * indisready removes what otherwise keeps a dead index out, and a
+		 * dead row must not be restored as a live definition however its drop
+		 * came to be interrupted.
+		 */
 		appendPQExpBuffer(query,
 						  "FROM unnest('%s'::pg_catalog.oid[]) AS src(tbloid)\n"
 						  "JOIN pg_catalog.pg_index i ON (src.tbloid = i.indrelid) "
@@ -7924,10 +7936,14 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 						  "c.contype IN ('p','u','x')) "
 						  "LEFT JOIN pg_catalog.pg_inherits inh "
 						  "ON (inh.inhrelid = indexrelid) "
-						  "WHERE (i.indisvalid OR t2.relkind = 'p') "
-						  "AND i.indisready "
+						  "WHERE (i.indisvalid OR t2.relkind = 'p'%s) "
+						  "AND (i.indisready%s) "
 						  "ORDER BY i.indrelid, indexname",
-						  tbloids->data);
+						  tbloids->data,
+						  fout->remoteVersion >= 200000 ?
+						  " OR (i.indisnodata AND i.indislive)" : "",
+						  fout->remoteVersion >= 200000 ?
+						  " OR (i.indisnodata AND i.indislive)" : "");
 	}
 	else
 	{
