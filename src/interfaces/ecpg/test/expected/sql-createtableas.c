@@ -123,41 +123,90 @@ if (sqlca.sqlcode < 0) sqlprint();}
 
 	printf("ID = %d\n", id);
 
-	{ ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "drop table cta_test", ECPGt_EOIT, ECPGt_EORT);
-#line 35 "createtableas.pgc"
+	/*
+	 * The scanner turns WITH into WITH_LA_NO whenever NO follows it, so check
+	 * that a CTE named "no" still parses.
+	 */
+	{ ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "with no as ( select id from cta_test ) select id from no", ECPGt_EOIT, 
+	ECPGt_int,&(id),(long)1,(long)1,sizeof(int), 
+	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, ECPGt_EORT);
+#line 39 "createtableas.pgc"
 
 if (sqlca.sqlwarn[0] == 'W') sqlprint();
-#line 35 "createtableas.pgc"
+#line 39 "createtableas.pgc"
 
 if (sqlca.sqlcode < 0) sqlprint();}
-#line 35 "createtableas.pgc"
+#line 39 "createtableas.pgc"
+
+	printf("ID = %d\n", id);
+
+	/* the clause the conversion exists for, on CREATE INDEX */
+	{ ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "create index cta_test_idx on cta_test ( id ) with no data", ECPGt_EOIT, ECPGt_EORT);
+#line 43 "createtableas.pgc"
+
+if (sqlca.sqlwarn[0] == 'W') sqlprint();
+#line 43 "createtableas.pgc"
+
+if (sqlca.sqlcode < 0) sqlprint();}
+#line 43 "createtableas.pgc"
+
+	{ ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "select indisnodata :: int from pg_index where indexrelid = 'cta_test_idx' :: regclass", ECPGt_EOIT, 
+	ECPGt_int,&(id),(long)1,(long)1,sizeof(int), 
+	ECPGt_NO_INDICATOR, NULL , 0L, 0L, 0L, ECPGt_EORT);
+#line 45 "createtableas.pgc"
+
+if (sqlca.sqlwarn[0] == 'W') sqlprint();
+#line 45 "createtableas.pgc"
+
+if (sqlca.sqlcode < 0) sqlprint();}
+#line 45 "createtableas.pgc"
+
+	printf("ID = %d\n", id);
+
+	{ ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "drop index cta_test_idx", ECPGt_EOIT, ECPGt_EORT);
+#line 48 "createtableas.pgc"
+
+if (sqlca.sqlwarn[0] == 'W') sqlprint();
+#line 48 "createtableas.pgc"
+
+if (sqlca.sqlcode < 0) sqlprint();}
+#line 48 "createtableas.pgc"
+
+	{ ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "drop table cta_test", ECPGt_EOIT, ECPGt_EORT);
+#line 49 "createtableas.pgc"
+
+if (sqlca.sqlwarn[0] == 'W') sqlprint();
+#line 49 "createtableas.pgc"
+
+if (sqlca.sqlcode < 0) sqlprint();}
+#line 49 "createtableas.pgc"
 
 	{ ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "drop table cta_test1", ECPGt_EOIT, ECPGt_EORT);
-#line 36 "createtableas.pgc"
+#line 50 "createtableas.pgc"
 
 if (sqlca.sqlwarn[0] == 'W') sqlprint();
-#line 36 "createtableas.pgc"
+#line 50 "createtableas.pgc"
 
 if (sqlca.sqlcode < 0) sqlprint();}
-#line 36 "createtableas.pgc"
+#line 50 "createtableas.pgc"
 
 	{ ECPGdo(__LINE__, 0, 1, NULL, 0, ECPGst_normal, "drop table cta_test2", ECPGt_EOIT, ECPGt_EORT);
-#line 37 "createtableas.pgc"
+#line 51 "createtableas.pgc"
 
 if (sqlca.sqlwarn[0] == 'W') sqlprint();
-#line 37 "createtableas.pgc"
+#line 51 "createtableas.pgc"
 
 if (sqlca.sqlcode < 0) sqlprint();}
-#line 37 "createtableas.pgc"
+#line 51 "createtableas.pgc"
 
 	{ ECPGdisconnect(__LINE__, "ALL");
-#line 38 "createtableas.pgc"
+#line 52 "createtableas.pgc"
 
 if (sqlca.sqlwarn[0] == 'W') sqlprint();
-#line 38 "createtableas.pgc"
+#line 52 "createtableas.pgc"
 
 if (sqlca.sqlcode < 0) sqlprint();}
-#line 38 "createtableas.pgc"
+#line 52 "createtableas.pgc"
 
 
 	return 0;

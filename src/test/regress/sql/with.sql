@@ -1800,3 +1800,16 @@ EXPLAIN (COSTS OFF)
 WITH cte AS (SELECT DISTINCT two, thousand FROM tenk1)
 SELECT * FROM cte t1, cte t2
 WHERE t1.two = 0 AND t2.two = 0 AND t1.thousand = t2.thousand;
+
+--
+-- Unreserved keywords as CTE names
+--
+-- The scanner converts WITH to a lookahead token when the next token is TIME,
+-- ORDINALITY or NO, so check that each is still usable as a CTE name.
+--
+WITH time AS (SELECT 1 AS x) SELECT * FROM time;
+WITH ordinality AS (SELECT 2 AS x) SELECT * FROM ordinality;
+WITH no AS (SELECT 3 AS x) SELECT * FROM no;
+WITH RECURSIVE no (x) AS (
+  SELECT 1 UNION ALL SELECT x + 1 FROM no WHERE x < 3
+) SELECT * FROM no;

@@ -120,7 +120,8 @@ static void UpdateIndexRelation(Oid indexoid, Oid heapoid,
 								bool isexclusion,
 								bool immediate,
 								bool isvalid,
-								bool isready);
+								bool isready,
+								bool isnodata);
 static void index_update_stats(Relation rel,
 							   bool hasindex,
 							   double reltuples);
@@ -572,7 +573,8 @@ UpdateIndexRelation(Oid indexoid,
 					bool isexclusion,
 					bool immediate,
 					bool isvalid,
-					bool isready)
+					bool isready,
+					bool isnodata)
 {
 	int2vector *indkey;
 	oidvector  *indcollation;
@@ -650,7 +652,7 @@ UpdateIndexRelation(Oid indexoid,
 	values[Anum_pg_index_indisready - 1] = BoolGetDatum(isready);
 	values[Anum_pg_index_indislive - 1] = BoolGetDatum(true);
 	values[Anum_pg_index_indisreplident - 1] = BoolGetDatum(false);
-	values[Anum_pg_index_indisnodata - 1] = BoolGetDatum(false);
+	values[Anum_pg_index_indisnodata - 1] = BoolGetDatum(isnodata);
 	values[Anum_pg_index_indkey - 1] = PointerGetDatum(indkey);
 	values[Anum_pg_index_indcollation - 1] = PointerGetDatum(indcollation);
 	values[Anum_pg_index_indclass - 1] = PointerGetDatum(indclass);
@@ -721,6 +723,12 @@ UpdateIndexRelation(Oid indexoid,
  *		INDEX_CREATE_DEFERRABLE:
  *			index supports a deferrable constraint, mark it as
  *			non-immediate (indimmediate = false).
+ *		INDEX_CREATE_NO_DATA:
+ *			the index is defined but deliberately left unpopulated
+ *			(CREATE INDEX ... WITH NO DATA).  Mark it indisnodata, and
+ *			neither valid nor ready, so that queries ignore it and the
+ *			executor does not maintain it.  Must be combined with
+ *			INDEX_CREATE_SKIP_BUILD; a later REINDEX populates it.
  *
  * constr_flags: flags passed to index_constraint_create
  *		(only if INDEX_CREATE_ADD_CONSTRAINT is set)
@@ -770,6 +778,7 @@ index_create(Relation heapRelation,
 	bool		invalid = (flags & INDEX_CREATE_INVALID) != 0;
 	bool		concurrent = (flags & INDEX_CREATE_CONCURRENT) != 0;
 	bool		partitioned = (flags & INDEX_CREATE_PARTITIONED) != 0;
+	bool		nodata = (flags & INDEX_CREATE_NO_DATA) != 0;
 	bool		progress = (flags & INDEX_CREATE_SUPPRESS_PROGRESS) == 0;
 	char		relkind;
 	TransactionId relfrozenxid;
@@ -781,6 +790,8 @@ index_create(Relation heapRelation,
 		   ((flags & INDEX_CREATE_ADD_CONSTRAINT) != 0));
 	/* partitioned indexes must never be "built" by themselves */
 	Assert(!partitioned || (flags & INDEX_CREATE_SKIP_BUILD));
+	/* a no-data index is unbuilt by definition, and can't be concurrent */
+	Assert(!nodata || ((flags & INDEX_CREATE_SKIP_BUILD) && !concurrent));
 
 	relkind = partitioned ? RELKIND_PARTITIONED_INDEX : RELKIND_INDEX;
 	is_exclusion = (indexInfo->ii_ExclusionOps != NULL);
@@ -1060,8 +1071,9 @@ index_create(Relation heapRelation,
 						isprimary, is_exclusion,
 						(constr_flags & INDEX_CONSTR_CREATE_DEFERRABLE) == 0 &&
 						(flags & INDEX_CREATE_DEFERRABLE) == 0,
-						!concurrent && !invalid,
-						!concurrent);
+						!concurrent && !invalid && !nodata,
+						!concurrent && !nodata,
+						nodata);
 
 	/*
 	 * Register relcache invalidation on the indexes' heap relation, to

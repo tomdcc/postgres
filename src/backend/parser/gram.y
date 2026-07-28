@@ -353,7 +353,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <defelt>	drop_option
 %type <boolean>	opt_or_replace opt_no
 				opt_grant_grant_option
-				opt_nowait opt_if_exists opt_with_data
+				opt_nowait opt_if_exists opt_with_data opt_index_no_data
 				opt_transaction_chain
 %type <list>	grant_role_opt_list
 %type <defelt>	grant_role_opt
@@ -824,10 +824,10 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
  * NOT_LA exists so that productions such as NOT LIKE can be given the same
  * precedence as LIKE; otherwise they'd effectively have the same precedence
  * as NOT, at least with respect to their left-hand subexpression.
- * FORMAT_LA, NULLS_LA, WITH_LA, and WITHOUT_LA are needed to make the grammar
- * LALR(1).
+ * FORMAT_LA, NULLS_LA, WITH_LA, WITH_LA_NO, and WITHOUT_LA are needed to make
+ * the grammar LALR(1).
  */
-%token		FORMAT_LA NOT_LA NULLS_LA WITH_LA WITHOUT_LA
+%token		FORMAT_LA NOT_LA NULLS_LA WITH_LA WITH_LA_NO WITHOUT_LA
 
 /*
  * The grammar likewise thinks these tokens are keywords, but they are never
@@ -1243,6 +1243,7 @@ CreateRoleStmt:
 
 opt_with:	WITH
 			| WITH_LA
+			| WITH_LA_NO
 			| /*EMPTY*/
 		;
 
@@ -4949,10 +4950,24 @@ create_as_target:
 				}
 		;
 
+/*
+ * Note that WITH NO DATA must be spelled with WITH_LA_NO, because the scanner
+ * converts WITH to WITH_LA_NO unconditionally whenever NO follows it.
+ */
 opt_with_data:
 			WITH DATA_P								{ $$ = true; }
-			| WITH NO DATA_P						{ $$ = false; }
+			| WITH_LA_NO NO DATA_P					{ $$ = false; }
 			| /*EMPTY*/								{ $$ = true; }
+		;
+
+/*
+ * Unlike opt_with_data, this does not accept the redundant WITH DATA: doing so
+ * would conflict with opt_reloptions, and would need a second lookahead token
+ * to resolve.
+ */
+opt_index_no_data:
+			WITH_LA_NO NO DATA_P					{ $$ = true; }
+			| /*EMPTY*/								{ $$ = false; }
 		;
 
 
@@ -8348,6 +8363,7 @@ defacl_privilege_target:
 IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_single_name
 			ON relation_expr access_method_clause '(' index_params ')'
 			opt_include opt_unique_null_treatment opt_reloptions OptTableSpace where_clause
+			opt_index_no_data
 				{
 					IndexStmt *n = makeNode(IndexStmt);
 
@@ -8362,6 +8378,7 @@ IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_single_name
 					n->options = $14;
 					n->tableSpace = $15;
 					n->whereClause = $16;
+					n->nodata = $17;
 					n->excludeOpNames = NIL;
 					n->idxcomment = NULL;
 					n->indexOid = InvalidOid;
@@ -8380,6 +8397,7 @@ IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_single_name
 			| CREATE opt_unique INDEX opt_concurrently IF_P NOT EXISTS name
 			ON relation_expr access_method_clause '(' index_params ')'
 			opt_include opt_unique_null_treatment opt_reloptions OptTableSpace where_clause
+			opt_index_no_data
 				{
 					IndexStmt *n = makeNode(IndexStmt);
 
@@ -8394,6 +8412,7 @@ IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_single_name
 					n->options = $17;
 					n->tableSpace = $18;
 					n->whereClause = $19;
+					n->nodata = $20;
 					n->excludeOpNames = NIL;
 					n->idxcomment = NULL;
 					n->indexOid = InvalidOid;
@@ -12054,9 +12073,10 @@ AlterTSConfigurationStmt:
 				}
 		;
 
-/* Use this if TIME or ORDINALITY after WITH should be taken as an identifier */
+/* Use this if TIME, ORDINALITY or NO after WITH should be taken as an identifier */
 any_with:	WITH
 			| WITH_LA
+			| WITH_LA_NO
 		;
 
 
@@ -13324,7 +13344,8 @@ simple_select:
  * WITH [ RECURSIVE ] <query name> [ (<column>,...) ]
  *		AS (query) [ SEARCH or CYCLE clause ]
  *
- * Recognizing WITH_LA here allows a CTE to be named TIME or ORDINALITY.
+ * Recognizing WITH_LA here allows a CTE to be named TIME or ORDINALITY, and
+ * WITH_LA_NO allows one to be named NO.
  */
 with_clause:
 		WITH cte_list
@@ -13335,6 +13356,13 @@ with_clause:
 				$$->location = @1;
 			}
 		| WITH_LA cte_list
+			{
+				$$ = makeNode(WithClause);
+				$$->ctes = $2;
+				$$->recursive = false;
+				$$->location = @1;
+			}
+		| WITH_LA_NO cte_list
 			{
 				$$ = makeNode(WithClause);
 				$$->ctes = $2;
