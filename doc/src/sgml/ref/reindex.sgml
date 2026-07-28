@@ -195,7 +195,9 @@ REINDEX [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] { DA
     <listitem>
      <para>
       Prints a progress report as each index is reindexed
-      at <literal>INFO</literal> level.
+      at <literal>INFO</literal> level.  Each partitioned index whose validity
+      is rechecked is reported too, whether or not the recheck could mark it
+      valid.
      </para>
     </listitem>
    </varlistentry>
@@ -322,6 +324,24 @@ REINDEX [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] { DA
    respectively. Each partition of the specified partitioned relation is
    reindexed in a separate transaction. Those commands cannot be used inside
    a transaction block when working on a partitioned table or index.
+  </para>
+
+  <para>
+   A partitioned index is valid only while every partition has a valid index
+   attached to it.  When <command>REINDEX INDEX</command> names a partitioned
+   index, the validity of that index, and of every partitioned index beneath
+   it, is rechecked once the leaf indexes have been rebuilt.  An index whose
+   partition has no index attached at all necessarily remains invalid, since
+   rebuilding cannot supply the missing one.
+   <command>REINDEX TABLE</command> on a partitioned table does not perform
+   this recheck.
+  </para>
+
+  <para>
+   <command>REINDEX</command> never modifies an index above the one it was
+   given: naming a partitioned index in the middle of a tree rechecks that
+   index and those below it, and leaves its own parent alone.  A tree with
+   more than one invalid level is therefore repaired from the bottom upwards.
   </para>
 
   <para>

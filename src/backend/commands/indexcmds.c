@@ -118,6 +118,8 @@ static Oid	ReindexTable(const ReindexStmt *stmt, const ReindexParams *params,
 static void ReindexMultipleTables(const ReindexStmt *stmt,
 								  const ReindexParams *params);
 static void reindex_error_callback(void *arg);
+static void ReindexReportValidity(Oid idxoid, bool validated,
+								  const ReindexParams *params);
 static void ReindexPartitions(const ReindexStmt *stmt, Oid relid,
 							  const ReindexParams *params, bool isTopLevel);
 static void ReindexMultipleInternal(const ReindexStmt *stmt, const List *relids,
@@ -3521,6 +3523,35 @@ reindex_error_callback(void *arg)
 }
 
 /*
+ * ReindexReportValidity
+ *		Say what a validity recheck did, under VERBOSE.
+ *
+ * Marking a partitioned index valid leaves no other trace in the command's
+ * output, and an index the recheck could not validate is the reason its tree
+ * stays unusable, so both are worth a line once progress reports have been
+ * asked for.  Silence is still the default: the recheck is bookkeeping that
+ * happens whether or not anyone is watching.
+ */
+static void
+ReindexReportValidity(Oid idxoid, bool validated, const ReindexParams *params)
+{
+	if ((params->options & REINDEXOPT_VERBOSE) == 0)
+		return;
+
+	if (validated)
+		ereport(INFO,
+				(errmsg("index \"%s.%s\" was marked valid",
+						get_namespace_name(get_rel_namespace(idxoid)),
+						get_rel_name(idxoid))));
+	else
+		ereport(INFO,
+				(errmsg("index \"%s.%s\" could not be marked valid",
+						get_namespace_name(get_rel_namespace(idxoid)),
+						get_rel_name(idxoid)),
+				 errdetail("Not every partition has a valid index attached to it.")));
+}
+
+/*
  * ReindexPartitions
  *
  * Reindex a set of partitions, per the partitioned index or table given
@@ -3530,6 +3561,7 @@ static void
 ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *params, bool isTopLevel)
 {
 	List	   *partitions = NIL;
+	List	   *partedidxs = NIL;
 	char		relkind = get_rel_relkind(relid);
 	char	   *relname = get_rel_name(relid);
 	char	   *relnamespace = get_namespace_name(get_rel_namespace(relid));
@@ -3585,10 +3617,19 @@ ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *param
 
 		/*
 		 * This discards partitioned tables, partitioned indexes and foreign
-		 * tables.
+		 * tables.  Partitioned indexes are remembered, though, so that their
+		 * validity can be rechecked once the rebuild is done; see below.
 		 */
 		if (!RELKIND_HAS_STORAGE(partkind))
+		{
+			if (partkind == RELKIND_PARTITIONED_INDEX)
+			{
+				old_context = MemoryContextSwitchTo(reindex_context);
+				partedidxs = lappend_oid(partedidxs, partoid);
+				MemoryContextSwitchTo(old_context);
+			}
 			continue;
+		}
 
 		Assert(partkind == RELKIND_INDEX ||
 			   partkind == RELKIND_RELATION);
@@ -3604,6 +3645,72 @@ ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *param
 	 * this commits and then starts a new transaction immediately.
 	 */
 	ReindexMultipleInternal(stmt, partitions, params);
+
+	/*
+	 * A partitioned index is valid only while every partition has a valid
+	 * index attached, and nothing recomputes that when a child index becomes
+	 * valid again.  Having just rebuilt every child, this is exactly the
+	 * moment the tree may have become validatable, so check now; otherwise a
+	 * user who reindexed a partitioned index to repair an invalid child would
+	 * be left with a parent that is still invalid, and no obvious way to fix
+	 * it.
+	 *
+	 * This is only done for REINDEX INDEX.  REINDEX TABLE on a partitioned
+	 * table also rebuilds every child index, but revalidating indexes the
+	 * user did not name is a larger behavioral change, and is left alone.
+	 *
+	 * Work from the deepest index upwards: validatePartitionedIndex()
+	 * recurses to a validated index's own parent, but never downwards, so an
+	 * intermediate partitioned index has to be validated before its parent
+	 * can be.  find_all_inheritors() returns breadth-first, so iterating in
+	 * reverse visits the deepest first.
+	 *
+	 * validatePartitionedIndex() is careful about the incomplete cases: it
+	 * counts valid children and marks the parent valid only if the count
+	 * reaches the number of partitions, so a partition with no attached index
+	 * at all correctly leaves the parent invalid.  That is not reported here:
+	 * every leaf rebuild either succeeded or raised an error, so an index
+	 * that is still invalid is one whose tree was already incomplete before
+	 * this command, which REINDEX neither caused nor can repair.
+	 *
+	 * Note ReindexMultipleInternal() committed our transaction and started a
+	 * new one, so the locks taken above are gone and must be retaken.  Lock
+	 * the table before the index, as the ATTACH PARTITION path does, to avoid
+	 * deadlocking against it.  That new transaction has no active snapshot
+	 * either, and updating pg_index needs one.
+	 */
+	if (relkind == RELKIND_PARTITIONED_INDEX)
+	{
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		for (int i = list_length(partedidxs) - 1; i >= 0; i--)
+		{
+			Oid			idxoid = list_nth_oid(partedidxs, i);
+			Relation	partedTbl;
+			Relation	partedIdx;
+			bool		validated;
+
+			/* Nothing to do if a deeper level already validated this one */
+			if (get_index_isvalid(idxoid))
+				continue;
+
+			partedTbl = table_open(IndexGetRelation(idxoid, false),
+								   ShareUpdateExclusiveLock);
+			partedIdx = index_open(idxoid, ShareUpdateExclusiveLock);
+
+			validated = validatePartitionedIndex(partedIdx, partedTbl, false);
+
+			index_close(partedIdx, NoLock);
+			table_close(partedTbl, NoLock);
+
+			ReindexReportValidity(idxoid, validated, params);
+
+			/* make the update visible to the next iteration */
+			CommandCounterIncrement();
+		}
+
+		PopActiveSnapshot();
+	}
 
 	/*
 	 * Clean up working storage --- note we must do this after

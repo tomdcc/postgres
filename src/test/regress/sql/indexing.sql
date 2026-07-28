@@ -935,6 +935,136 @@ select indexrelid::regclass, indisvalid,
   order by indexrelid::regclass::text collate "C";
 drop table parted_isvalid_tab;
 
+-- REINDEX on a partitioned index revalidates it once every partition has a
+-- valid index again.  Nothing else recomputes that, so without this a tree
+-- invalidated by one bad child could not be brought back to valid by
+-- repairing the child.
+--
+-- Make the child index fail to build via an immutable function that can then
+-- be replaced, rather than via bad row data: repairing the data would leave a
+-- recently-dead tuple, which a rebuild still evaluates the expression on.
+create function parted_reind_f(int) returns int
+  immutable language sql as 'select $1 / 0';
+create table parted_reind_tab (a int) partition by range (a);
+create table parted_reind_tab_1 partition of parted_reind_tab
+  for values from (1) to (10) partition by range (a);
+create table parted_reind_tab_11 partition of parted_reind_tab_1
+  for values from (1) to (5);
+create table parted_reind_tab_2 partition of parted_reind_tab
+  for values from (10) to (20);
+insert into parted_reind_tab_11 values (1);
+-- a failed concurrent build leaves an invalid index on one partition
+create index concurrently parted_reind_idx_11
+  on parted_reind_tab_11 (parted_reind_f(a));
+-- creating the tree adopts that invalid index, invalidating every index above
+-- it (the other partition is empty, so its build does not call the function)
+create index parted_reind_idx on parted_reind_tab (parted_reind_f(a));
+select indexrelid::regclass, indisvalid,
+       indrelid::regclass, inhparent::regclass
+  from pg_index idx left join
+       pg_inherits inh on (idx.indexrelid = inh.inhrelid)
+  where indexrelid::regclass::text like 'parted_reind%'
+  order by indexrelid::regclass::text collate "C";
+-- repair the function and reindex the top-level index: the whole tree goes
+-- valid, including the intermediate partitioned index
+create or replace function parted_reind_f(int) returns int
+  immutable language sql as 'select $1';
+reindex index parted_reind_idx;
+select indexrelid::regclass, indisvalid,
+       indrelid::regclass, inhparent::regclass
+  from pg_index idx left join
+       pg_inherits inh on (idx.indexrelid = inh.inhrelid)
+  where indexrelid::regclass::text like 'parted_reind%'
+  order by indexrelid::regclass::text collate "C";
+drop table parted_reind_tab;
+drop function parted_reind_f(int);
+
+-- But a partition with no attached index at all must keep the parent invalid,
+-- since rebuilding the children cannot make the tree complete.
+create table parted_reind2_tab (a int) partition by range (a);
+create table parted_reind2_tab_1 partition of parted_reind2_tab
+  for values from (1) to (10);
+create table parted_reind2_tab_2 partition of parted_reind2_tab
+  for values from (10) to (20);
+create index parted_reind2_idx_1 on parted_reind2_tab_1 (a);
+create index parted_reind2_idx on only parted_reind2_tab (a);
+alter index parted_reind2_idx attach partition parted_reind2_idx_1;
+reindex index parted_reind2_idx;
+select indexrelid::regclass, indisvalid
+  from pg_index
+  where indexrelid::regclass::text like 'parted_reind2%'
+  order by indexrelid::regclass::text collate "C";
+drop table parted_reind2_tab;
+
+-- VERBOSE names each partitioned index the recheck marks valid, and each one
+-- it could not: the latter is the level that is the reason a tree stays
+-- unusable, which is otherwise reported nowhere.
+create function parted_reind11_f(int) returns int
+  immutable language sql as 'select $1 / 0';
+create table parted_reind11_tab (a int) partition by range (a);
+create table parted_reind11_tab_1 partition of parted_reind11_tab
+  for values from (1) to (10) partition by range (a);
+create table parted_reind11_tab_11 partition of parted_reind11_tab_1
+  for values from (1) to (5);
+-- a second partition of the top, which never acquires an index
+create table parted_reind11_tab_2 partition of parted_reind11_tab
+  for values from (10) to (20);
+insert into parted_reind11_tab_11 values (1);
+create index concurrently parted_reind11_idx_11
+  on parted_reind11_tab_11 (parted_reind11_f(a));
+create index parted_reind11_idx_1
+  on only parted_reind11_tab_1 (parted_reind11_f(a));
+create index parted_reind11_idx
+  on only parted_reind11_tab (parted_reind11_f(a));
+alter index parted_reind11_idx_1 attach partition parted_reind11_idx_11;
+alter index parted_reind11_idx attach partition parted_reind11_idx_1;
+create or replace function parted_reind11_f(int) returns int
+  immutable language sql as 'select $1';
+\set VERBOSITY terse \\ -- suppress machine-dependent details
+reindex (verbose) index parted_reind11_idx;
+\set VERBOSITY default
+select indexrelid::regclass, indisvalid
+  from pg_index
+  where indexrelid::regclass::text like 'parted_reind11%'
+  order by indexrelid::regclass::text collate "C";
+drop table parted_reind11_tab;
+drop function parted_reind11_f(int);
+
+-- REINDEX never touches an index above the one named: reindexing an
+-- intermediate partitioned index validates it and its own children, and
+-- leaves its parent alone.
+create function parted_reind3_f(int) returns int
+  immutable language sql as 'select $1 / 0';
+create table parted_reind3_tab (a int) partition by range (a);
+create table parted_reind3_tab_1 partition of parted_reind3_tab
+  for values from (1) to (10) partition by range (a);
+create table parted_reind3_tab_11 partition of parted_reind3_tab_1
+  for values from (1) to (5);
+insert into parted_reind3_tab_11 values (1);
+create index concurrently parted_reind3_idx_11
+  on parted_reind3_tab_11 (parted_reind3_f(a));
+create index parted_reind3_idx_1
+  on only parted_reind3_tab_1 (parted_reind3_f(a));
+create index parted_reind3_idx
+  on only parted_reind3_tab (parted_reind3_f(a));
+-- attaching an invalid leaf leaves both levels above it invalid
+alter index parted_reind3_idx_1 attach partition parted_reind3_idx_11;
+alter index parted_reind3_idx attach partition parted_reind3_idx_1;
+select indexrelid::regclass, indisvalid
+  from pg_index
+  where indexrelid::regclass::text like 'parted_reind3%'
+  order by indexrelid::regclass::text collate "C";
+create or replace function parted_reind3_f(int) returns int
+  immutable language sql as 'select $1';
+-- reindexing the intermediate validates it and its leaf, but not the top
+reindex index parted_reind3_idx_1;
+select indexrelid::regclass, indisvalid
+  from pg_index
+  where indexrelid::regclass::text like 'parted_reind3%'
+  order by indexrelid::regclass::text collate "C";
+drop table parted_reind3_tab;
+drop function parted_reind3_f(int);
+
 -- Check state of replica indexes when attaching a partition.
 begin;
 create table parted_replica_tab (id int not null) partition by range (id);
