@@ -3591,3 +3591,158 @@ drop cascades to materialized view matview
 drop cascades to view view
 drop cascades to table reindex_before
 drop cascades to table reindex_after
+--
+-- CREATE INDEX ... WITH NO DATA
+--
+RESET search_path;
+CREATE TABLE nodata_tab (a int, b text);
+INSERT INTO nodata_tab SELECT g, g::text FROM generate_series(1, 1000) g;
+CREATE INDEX nodata_idx ON nodata_tab (a) WITH NO DATA;
+-- live, but neither ready nor valid, and flagged as deliberately empty
+SELECT indisnodata, indisvalid, indisready, indislive
+  FROM pg_index WHERE indexrelid = 'nodata_idx'::regclass;
+ indisnodata | indisvalid | indisready | indislive 
+-------------+------------+------------+-----------
+ t           | f          | f          | t
+(1 row)
+
+-- no build happened, so no storage was consumed
+SELECT pg_relation_size('nodata_idx');
+ pg_relation_size 
+------------------
+                0
+(1 row)
+
+-- the planner ignores it, even when told not to seqscan
+EXPLAIN (COSTS OFF) SELECT * FROM nodata_tab WHERE a = 42;
+       QUERY PLAN       
+------------------------
+ Seq Scan on nodata_tab
+   Filter: (a = 42)
+(2 rows)
+
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT * FROM nodata_tab WHERE a = 42;
+       QUERY PLAN       
+------------------------
+ Seq Scan on nodata_tab
+   Disabled: true
+   Filter: (a = 42)
+(3 rows)
+
+RESET enable_seqscan;
+-- DML during the gap succeeds and does not maintain the index
+INSERT INTO nodata_tab VALUES (1001, '1001');
+UPDATE nodata_tab SET a = -1 WHERE a = 500;
+DELETE FROM nodata_tab WHERE a = 600;
+SELECT pg_relation_size('nodata_idx');
+ pg_relation_size 
+------------------
+                0
+(1 row)
+
+-- a unique index WITH NO DATA enforces nothing at all: duplicates are admitted
+CREATE UNIQUE INDEX nodata_uidx ON nodata_tab (b) WITH NO DATA;
+INSERT INTO nodata_tab VALUES (2, '2');
+SELECT count(*) FROM nodata_tab WHERE b = '2';
+ count 
+-------
+     2
+(1 row)
+
+-- so ON CONFLICT cannot infer it ...
+INSERT INTO nodata_tab VALUES (3, '3') ON CONFLICT (b) DO NOTHING;
+ERROR:  there is no unique or exclusion constraint matching the ON CONFLICT specification
+-- ... and it cannot be promoted to a constraint (pre-existing indisvalid guard)
+ALTER TABLE nodata_tab ADD CONSTRAINT nodata_b_key UNIQUE USING INDEX nodata_uidx;
+ERROR:  index "nodata_uidx" is not valid
+LINE 1: ALTER TABLE nodata_tab ADD CONSTRAINT nodata_b_key UNIQUE US...
+                                   ^
+-- the clause combines with the rest of CREATE INDEX's tail
+CREATE INDEX nodata_partial_idx ON nodata_tab USING btree (a)
+    WITH (fillfactor = 70) WHERE a > 5 WITH NO DATA;
+SELECT indisnodata FROM pg_index
+  WHERE indexrelid = 'nodata_partial_idx'::regclass;
+ indisnodata 
+-------------
+ t
+(1 row)
+
+-- the scanner's WITH -> WITH_LA_NO conversion must not disturb DATA or NO used
+-- as identifiers, including alongside the clause itself
+CREATE TABLE data (no int);
+CREATE INDEX data_idx ON data USING btree (no)
+    WITH (fillfactor = 70) WITH NO DATA;
+SELECT indisnodata FROM pg_index WHERE indexrelid = 'data_idx'::regclass;
+ indisnodata 
+-------------
+ t
+(1 row)
+
+WITH data AS (SELECT 1 AS no) SELECT no FROM data;
+ no 
+----
+  1
+(1 row)
+
+WITH no AS (SELECT 1 AS data) SELECT data FROM no;
+ data 
+------
+    1
+(1 row)
+
+DROP TABLE data;
+-- pg_get_indexdef reports the state, with the clause last as the grammar
+-- puts it
+SELECT pg_get_indexdef('nodata_partial_idx'::regclass);
+                                                    pg_get_indexdef                                                     
+------------------------------------------------------------------------------------------------------------------------
+ CREATE INDEX nodata_partial_idx ON public.nodata_tab USING btree (a) WITH (fillfactor='70') WHERE (a > 5) WITH NO DATA
+(1 row)
+
+-- CONCURRENTLY and WITH NO DATA are contradictory
+CREATE INDEX CONCURRENTLY nodata_conc_idx ON nodata_tab (a) WITH NO DATA;
+ERROR:  cannot create index CONCURRENTLY WITH NO DATA
+HINT:  Use REINDEX INDEX CONCURRENTLY to populate the index later.
+-- likewise on a temporary table, where CONCURRENTLY is silently downgraded
+CREATE TEMP TABLE nodata_temp (a int);
+CREATE INDEX CONCURRENTLY nodata_temp_idx ON nodata_temp (a) WITH NO DATA;
+ERROR:  cannot create index CONCURRENTLY WITH NO DATA
+HINT:  Use REINDEX INDEX CONCURRENTLY to populate the index later.
+DROP TABLE nodata_temp;
+-- accepted on a partitioned table, where it defers the build of every
+-- partition's index.  It is the partitions' indexes that carry the state here;
+-- the partitioned indexes are not yet marked, and are invalid until their
+-- partitions' indexes are populated, as any partitioned index is.
+CREATE TABLE nodata_part (a int) PARTITION BY RANGE (a);
+CREATE TABLE nodata_part_1 PARTITION OF nodata_part
+  FOR VALUES FROM (1) TO (10) PARTITION BY RANGE (a);
+CREATE TABLE nodata_part_11 PARTITION OF nodata_part_1 FOR VALUES FROM (1) TO (10);
+CREATE TABLE nodata_part_2 PARTITION OF nodata_part FOR VALUES FROM (10) TO (20);
+INSERT INTO nodata_part SELECT generate_series(1, 19);
+CREATE INDEX nodata_part_idx ON nodata_part (a) WITH NO DATA;
+SELECT c.relname, c.relkind, i.indisnodata, i.indisvalid,
+       pg_relation_size(i.indexrelid) AS size
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid IN ('nodata_part'::regclass, 'nodata_part_1'::regclass,
+                       'nodata_part_11'::regclass, 'nodata_part_2'::regclass)
+  ORDER BY 1;
+       relname        | relkind | indisnodata | indisvalid | size 
+----------------------+---------+-------------+------------+------
+ nodata_part_11_a_idx | i       | t           | f          |    0
+ nodata_part_1_a_idx  | I       | f           | f          |    0
+ nodata_part_2_a_idx  | i       | t           | f          |    0
+ nodata_part_idx      | I       | f           | f          |    0
+(4 rows)
+
+DROP TABLE nodata_part;
+-- rejected on system catalogs, whose scans do not consult indisvalid
+SET allow_system_table_mods = on;
+CREATE INDEX ON pg_class (relname) WITH NO DATA;
+ERROR:  cannot create index on system catalog "pg_class" WITH NO DATA
+RESET allow_system_table_mods;
+-- WITH DATA is not accepted here, unlike CREATE TABLE AS (see gram.y)
+CREATE INDEX nodata_withdata_idx ON nodata_tab (a) WITH DATA;
+ERROR:  syntax error at or near "DATA"
+LINE 1: ...REATE INDEX nodata_withdata_idx ON nodata_tab (a) WITH DATA;
+                                                                  ^

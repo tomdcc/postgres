@@ -28,6 +28,7 @@ CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ [ IF NOT EXISTS ] <replaceable class=
     [ WITH ( <replaceable class="parameter">storage_parameter</replaceable> [= <replaceable class="parameter">value</replaceable>] [, ... ] ) ]
     [ TABLESPACE <replaceable class="parameter">tablespace_name</replaceable> ]
     [ WHERE <replaceable class="parameter">predicate</replaceable> ]
+    [ WITH NO DATA ]
 </synopsis>
  </refsynopsisdiv>
 
@@ -380,6 +381,26 @@ CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ [ IF NOT EXISTS ] <replaceable class=
       </listitem>
      </varlistentry>
 
+     <varlistentry>
+      <term><literal>WITH NO DATA</literal></term>
+      <listitem>
+       <para>
+        Create the index definition only, without building the index.  The
+        command completes in constant time regardless of the size of the
+        table, and the resulting index contains no entries, is not maintained
+        as the table changes, and is not used by queries.  A later
+        <link linkend="sql-reindex"><command>REINDEX</command></link> naming
+        the index performs the build &mdash; see
+        <xref linkend="sql-createindex-with-no-data"/> below.
+       </para>
+       <para>
+        This option cannot be combined with <literal>CONCURRENTLY</literal>,
+        and is not accepted for indexes created by constraint syntax or on
+        system catalogs.
+       </para>
+      </listitem>
+     </varlistentry>
+
     </variablelist>
 
   <refsect2 id="sql-createindex-storage-parameters" xreflabel="Index Storage Parameters">
@@ -705,6 +726,96 @@ Indexes:
     non-concurrently in order to reduce the time where writes to the
     partitioned table will be locked out.  In this case, building the
     partitioned index is a metadata only operation.
+   </para>
+
+  </refsect2>
+
+  <refsect2 id="sql-createindex-with-no-data" xreflabel="Creating Indexes Without Building Them">
+   <title>Creating Indexes Without Building Them</title>
+
+   <para>
+    <literal>WITH NO DATA</literal> creates the index definition without
+    building the index.  The command writes catalog entries and returns, in
+    constant time regardless of the size of the table.  Because it builds
+    nothing, it takes only <literal>SHARE UPDATE EXCLUSIVE</literal> on the
+    table, as
+    <link linkend="sql-createindex-concurrently"><literal>CONCURRENTLY</literal></link>
+    does, and so neither waits for nor blocks concurrent
+    <command>INSERT</command>, <command>UPDATE</command> or
+    <command>DELETE</command>.
+    The index contains no entries, is not maintained as the table changes, and
+    is not used by queries, until it is populated by
+    <link linkend="sql-reindex"><command>REINDEX INDEX</command></link>.
+    <command>REINDEX</command> is covered by the
+    <literal>MAINTAIN</literal> privilege, so this can be done by a role that
+    does not own the table.
+   </para>
+
+   <caution>
+    <para>
+     A unique index created <literal>WITH NO DATA</literal> enforces
+     <emphasis>nothing at all</emphasis> until it has been populated, and is in
+     that respect weaker than a constraint added <literal>NOT VALID</literal>,
+     which enforces newly inserted rows immediately.  Duplicate values can be
+     inserted freely between creating such an index and populating it.
+    </para>
+   </caution>
+
+   <para>
+    If duplicate values were inserted during that interval, the
+    <command>REINDEX</command> that would populate the index fails with a
+    uniqueness violation and the index is left unpopulated, so that the
+    operation can be retried once the data has been corrected.
+   </para>
+
+   <para>
+    On a partitioned table, <literal>WITH NO DATA</literal> defers the build of
+    the index on each partition.  The partitioned index itself is not marked as
+    having no data, having no storage of its own; it is invalid until its
+    partitions' indexes are populated, as is any partitioned index whose
+    partitions do not all have a valid index attached.  Naming it in
+    <link linkend="sql-reindex"><command>REINDEX INDEX</command></link>
+    populates them all.
+   </para>
+
+   <para>
+    A partition's index may equally be created this way on its own and attached
+    afterwards with
+    <link linkend="sql-alterindex"><command>ALTER INDEX ... ATTACH
+    PARTITION</command></link>.  Note that populating it does not by itself
+    re-check the partitioned index above it, so populate it before attaching if
+    that index is to become valid as a result.
+   </para>
+
+   <para>
+    If it was attached first, re-issuing
+    <command>ALTER INDEX ... ATTACH PARTITION</command> for the
+    already-attached index re-checks the partitioned index above it.  With
+    sub-partitioning, do this at each level that is still invalid, working
+    upwards from the deepest.
+   </para>
+
+   <para>
+    <function>pg_get_indexdef</function> includes the
+    <literal>WITH NO DATA</literal> clause until the index is populated, so the
+    reconstructed definition always reflects the index's current state.
+   </para>
+
+   <para>
+    Such an index is invalid until it is populated, so a query that looks for
+    invalid indexes finds it alongside those left behind by a failed build.
+    <structfield>indisnodata</structfield> distinguishes them.  To list the
+    indexes that are still awaiting a build:
+<programlisting>
+SELECT n.nspname, t.relname AS table, c.relname AS index
+  FROM pg_index i
+  JOIN pg_class c ON c.oid = i.indexrelid
+  JOIN pg_class t ON t.oid = i.indrelid
+  JOIN pg_namespace n ON n.oid = c.relnamespace
+  WHERE i.indisnodata;
+</programlisting>
+    A query that looks for indexes to drop or rebuild after a failed build
+    should exclude them with <literal>NOT indisnodata</literal>.
    </para>
 
   </refsect2>

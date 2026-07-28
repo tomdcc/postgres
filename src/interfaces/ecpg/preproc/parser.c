@@ -149,12 +149,19 @@ filtered_base_yylex(void)
 			break;
 
 		case WITH:
-			/* Replace WITH by WITH_LA if it's followed by TIME or ORDINALITY */
+
+			/*
+			 * Replace WITH by WITH_LA if it's followed by TIME or ORDINALITY,
+			 * or by WITH_LA_NO if it's followed by NO.
+			 */
 			switch (next_token)
 			{
 				case TIME:
 				case ORDINALITY:
 					cur_token = WITH_LA;
+					break;
+				case NO:
+					cur_token = WITH_LA_NO;
 					break;
 			}
 			break;

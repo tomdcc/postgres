@@ -1,0 +1,17 @@
+Parsed test spec with 3 sessions
+
+starting permutation: wbegin wins cindex_nodata oins wcommit
+step wbegin: BEGIN;
+step wins: INSERT INTO cin_tab VALUES (11);
+step cindex_nodata: CREATE INDEX cin_idx ON cin_tab (i) WITH NO DATA;
+step oins: INSERT INTO cin_tab VALUES (12);
+step wcommit: COMMIT;
+
+starting permutation: wbegin wins cindex_plain oins wcommit
+step wbegin: BEGIN;
+step wins: INSERT INTO cin_tab VALUES (11);
+step cindex_plain: CREATE INDEX cin_idx2 ON cin_tab (i); <waiting ...>
+step oins: INSERT INTO cin_tab VALUES (12); <waiting ...>
+step wcommit: COMMIT;
+step cindex_plain: <... completed>
+step oins: <... completed>
