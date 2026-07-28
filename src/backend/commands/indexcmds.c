@@ -3530,6 +3530,7 @@ static void
 ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *params, bool isTopLevel)
 {
 	List	   *partitions = NIL;
+	List	   *partedrels = NIL;
 	char		relkind = get_rel_relkind(relid);
 	char	   *relname = get_rel_name(relid);
 	char	   *relnamespace = get_namespace_name(get_rel_namespace(relid));
@@ -3585,10 +3586,20 @@ ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *param
 
 		/*
 		 * This discards partitioned tables, partitioned indexes and foreign
-		 * tables.
+		 * tables.  Partitioned indexes are remembered, though, so that their
+		 * validity can be rechecked once the rebuild is done; see below.
 		 */
 		if (!RELKIND_HAS_STORAGE(partkind))
+		{
+			if (partkind == RELKIND_PARTITIONED_INDEX ||
+				partkind == RELKIND_PARTITIONED_TABLE)
+			{
+				old_context = MemoryContextSwitchTo(reindex_context);
+				partedrels = lappend_oid(partedrels, partoid);
+				MemoryContextSwitchTo(old_context);
+			}
 			continue;
+		}
 
 		Assert(partkind == RELKIND_INDEX ||
 			   partkind == RELKIND_RELATION);
@@ -3604,6 +3615,117 @@ ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *param
 	 * this commits and then starts a new transaction immediately.
 	 */
 	ReindexMultipleInternal(stmt, partitions, params);
+
+	/*
+	 * A partitioned index is valid only while every partition has a valid
+	 * index attached, and nothing recomputes that when a child index becomes
+	 * valid again.  Having just rebuilt every child, this is exactly the
+	 * moment such an index may have become validatable, so check now;
+	 * otherwise a user who reindexed to repair an invalid child would be left
+	 * with an index that is still invalid, and no obvious way to fix it.
+	 *
+	 * Only ever work downwards: recheck the index named, or the indexes of
+	 * the table named, and everything beneath, but never an index above.
+	 * Besides being the less surprising rule, this keeps REINDEX from taking
+	 * locks on relations the user did not name.
+	 *
+	 * Deepest first, because validatePartitionedIndex() recurses to a
+	 * validated index's own parent but never downwards, so an intermediate
+	 * partitioned index has to be validated before its parent can be.
+	 * find_all_inheritors() returns breadth-first, so iterating in reverse
+	 * visits the deepest first.
+	 *
+	 * validatePartitionedIndex() handles the incomplete cases: it counts
+	 * valid attached children and marks the index valid only if the count
+	 * reaches the number of partitions, so a partition with no index
+	 * attached, or one that exists but is not attached, correctly leaves it
+	 * invalid.  That is not reported: every leaf rebuild either succeeded or
+	 * raised an error, so an index still invalid afterwards is one whose tree
+	 * was already incomplete, which REINDEX neither caused nor can repair.
+	 *
+	 * Note ReindexMultipleInternal() committed our transaction and started a
+	 * new one, so the locks taken above are gone and must be retaken.  Lock
+	 * the table before the index, as REINDEX does elsewhere (see
+	 * RangeVarCallbackForReindexIndex()).  ATTACH PARTITION locks in the
+	 * other order, parent index first, so the two can deadlock; the deadlock
+	 * detector resolves that, as it already had to for REINDEX INDEX on a
+	 * partitioned index.  The relations may also have been dropped since we
+	 * listed them, hence the try_ variants.  The new transaction has no
+	 * active snapshot either, and updating pg_index needs one.
+	 */
+	{
+		List	   *tovalidate = NIL;
+
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		/*
+		 * Collect the partitioned indexes to recheck, deepest first.  When an
+		 * index was named these are the entries themselves; when a table was
+		 * named they are the partitioned indexes on each partitioned table in
+		 * the tree.
+		 */
+		for (int i = list_length(partedrels) - 1; i >= 0; i--)
+		{
+			Oid			oid = list_nth_oid(partedrels, i);
+
+			if (relkind == RELKIND_PARTITIONED_INDEX)
+				tovalidate = lappend_oid(tovalidate, oid);
+			else
+			{
+				Relation	partedTbl;
+				ListCell   *lc2;
+
+				/* the relation may have gone away since we listed it */
+				partedTbl = try_table_open(oid, ShareUpdateExclusiveLock);
+				if (partedTbl == NULL)
+					continue;
+
+				foreach(lc2, RelationGetIndexList(partedTbl))
+					tovalidate = lappend_oid(tovalidate, lfirst_oid(lc2));
+
+				table_close(partedTbl, NoLock);
+			}
+		}
+
+		foreach(lc, tovalidate)
+		{
+			Oid			idxoid = lfirst_oid(lc);
+			Oid			tbloid;
+			Relation	partedTbl;
+			Relation	partedIdx;
+
+			if (get_rel_relkind(idxoid) != RELKIND_PARTITIONED_INDEX)
+				continue;
+
+			/* nothing to do if a deeper level already validated this one */
+			if (get_index_isvalid(idxoid))
+				continue;
+
+			tbloid = IndexGetRelation(idxoid, true);
+			if (!OidIsValid(tbloid))
+				continue;
+
+			partedTbl = try_table_open(tbloid, ShareUpdateExclusiveLock);
+			if (partedTbl == NULL)
+				continue;
+			partedIdx = try_index_open(idxoid, ShareUpdateExclusiveLock);
+			if (partedIdx == NULL)
+			{
+				table_close(partedTbl, NoLock);
+				continue;
+			}
+
+			validatePartitionedIndex(partedIdx, partedTbl, false);
+
+			index_close(partedIdx, NoLock);
+			table_close(partedTbl, NoLock);
+
+			/* make the update visible to the next iteration */
+			CommandCounterIncrement();
+		}
+
+		PopActiveSnapshot();
+	}
 
 	/*
 	 * Clean up working storage --- note we must do this after

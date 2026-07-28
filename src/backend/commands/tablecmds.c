@@ -755,7 +755,6 @@ static void DetachPartitionFinalize(Relation rel, Relation partRel,
 static ObjectAddress ATExecDetachPartitionFinalize(Relation rel, RangeVar *name);
 static ObjectAddress ATExecAttachPartitionIdx(List **wqueue, Relation parentIdx,
 											  RangeVar *name);
-static void validatePartitionedIndex(Relation partedIdx, Relation partedTbl);
 static void refuseDupeIndexAttach(Relation parentIdx, Relation partIdx,
 								  Relation partitionTbl);
 static void verifyPartitionIndexNotNull(IndexInfo *iinfo, Relation partition);
@@ -22492,7 +22491,7 @@ ATExecAttachPartitionIdx(List **wqueue, Relation parentIdx, RangeVar *name)
 
 		free_attrmap(attmap);
 
-		validatePartitionedIndex(parentIdx, parentTbl);
+		validatePartitionedIndex(parentIdx, parentTbl, true);
 	}
 	else if (!parentIdx->rd_index->indisvalid)
 	{
@@ -22500,7 +22499,7 @@ ATExecAttachPartitionIdx(List **wqueue, Relation parentIdx, RangeVar *name)
 		 * The index is attached, but the parent is still invalid; see if it
 		 * can be validated now.
 		 */
-		validatePartitionedIndex(parentIdx, parentTbl);
+		validatePartitionedIndex(parentIdx, parentTbl, true);
 	}
 
 	relation_close(parentTbl, AccessShareLock);
@@ -22536,11 +22535,30 @@ refuseDupeIndexAttach(Relation parentIdx, Relation partIdx, Relation partitionTb
 /*
  * Verify whether the set of attached partition indexes to a parent index on
  * a partitioned table is complete.  If it is, mark the parent index valid.
+ * Returns true if the index is valid on return, false if it could not be.
  *
- * This should be called each time a partition index is attached.
+ * This should be called each time a partition index is attached, and each
+ * time an attached partition index may have become valid -- the latter is why
+ * REINDEX on a partitioned index calls it too.
+ *
+ * If validate_parent is set and this index does become valid, recurse to its
+ * own parent, which may in turn have become complete.  ATTACH PARTITION wants
+ * that, because attaching a child is exactly what can complete an ancestor.
+ * REINDEX does not: it must not modify catalog entries for indexes above the
+ * one the user named, both because that would be surprising and because
+ * ascending would take ancestor locks while holding descendant ones.  Note
+ * that ATTACH PARTITION locks the parent index before the child and then
+ * ascends from there, so it holds locks in both directions; a command that
+ * traverses the tree can deadlock against it whichever way it goes, and
+ * REINDEX INDEX on a partitioned index already can.
+ *
+ * Callers must hold a lock on both relations strong enough to prevent
+ * concurrent changes to the set of partitions and to the children's
+ * indisvalid flags.
  */
-static void
-validatePartitionedIndex(Relation partedIdx, Relation partedTbl)
+bool
+validatePartitionedIndex(Relation partedIdx, Relation partedTbl,
+						 bool validate_parent)
 {
 	Relation	inheritsRel;
 	SysScanDesc scan;
@@ -22613,7 +22631,7 @@ validatePartitionedIndex(Relation partedIdx, Relation partedTbl)
 	 * If this index is in turn a partition of a larger index, validating it
 	 * might cause the parent to become valid also.  Try that.
 	 */
-	if (updated && partedIdx->rd_rel->relispartition)
+	if (validate_parent && updated && partedIdx->rd_rel->relispartition)
 	{
 		Oid			parentIdxId,
 					parentTblId;
@@ -22629,11 +22647,13 @@ validatePartitionedIndex(Relation partedIdx, Relation partedTbl)
 		parentTbl = relation_open(parentTblId, AccessExclusiveLock);
 		Assert(!parentIdx->rd_index->indisvalid);
 
-		validatePartitionedIndex(parentIdx, parentTbl);
+		validatePartitionedIndex(parentIdx, parentTbl, true);
 
 		relation_close(parentIdx, AccessExclusiveLock);
 		relation_close(parentTbl, AccessExclusiveLock);
 	}
+
+	return updated;
 }
 
 /*
