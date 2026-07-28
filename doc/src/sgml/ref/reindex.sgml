@@ -325,6 +325,35 @@ REINDEX [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] { DA
   </para>
 
   <para>
+   A partitioned index is valid only while every partition has a valid index
+   attached to it.  Once the leaf indexes have been rebuilt,
+   <command>REINDEX</command> rechecks that condition: for
+   <command>REINDEX INDEX</command>, on the index named and every partitioned
+   index beneath it; for <command>REINDEX TABLE</command>, on the partitioned
+   indexes of the table named and of the partitioned tables beneath it.  An
+   index whose partition has no index attached at all, or has one that exists
+   but is not attached, necessarily remains invalid, since rebuilding cannot
+   supply the missing one.
+  </para>
+
+  <para>
+   <command>REINDEX SCHEMA</command>, <command>REINDEX DATABASE</command> and
+   <command>REINDEX SYSTEM</command> do not perform this recheck, although they
+   do rebuild the indexes it would depend on: those forms process relations
+   that have storage, reaching each leaf partition directly, and never visit a
+   partitioned table or index.  A partitioned index left invalid by an earlier
+   failure is therefore not brought back to valid by them; name the
+   partitioned index or table directly to have it rechecked.
+  </para>
+
+  <para>
+   <command>REINDEX</command> never modifies an index above the one it was
+   given: naming a partitioned index in the middle of a tree rechecks that
+   index and those below it, and leaves its own parent alone.  Naming the
+   top-level index rechecks every level beneath it.
+  </para>
+
+  <para>
    When using the <literal>TABLESPACE</literal> clause with
    <command>REINDEX</command> on a partitioned index or table, only the
    tablespace references of the leaf partitions are updated. As partitioned
