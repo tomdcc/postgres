@@ -1474,8 +1474,8 @@ ProcessUtilitySlow(ParseState *pstate,
 					 * eventually be needed here, so the lockmode calculation
 					 * needs to match what DefineIndex() does.
 					 */
-					lockmode = stmt->concurrent ? ShareUpdateExclusiveLock
-						: ShareLock;
+					lockmode = (stmt->concurrent || stmt->nodata)
+						? ShareUpdateExclusiveLock : ShareLock;
 					relid =
 						RangeVarGetRelidExtended(stmt->relation, lockmode,
 												 0,

@@ -1571,6 +1571,10 @@ pg_get_indexdef_worker(Oid indexrelid, int colno,
 			else
 				appendStringInfo(&buf, " WHERE %s", str);
 		}
+
+		/* Last, as the grammar has it.  Constraint indexes are never no-data. */
+		if (idxrec->indisnodata)
+			appendStringInfoString(&buf, " WITH NO DATA");
 	}
 
 	/* Clean up */

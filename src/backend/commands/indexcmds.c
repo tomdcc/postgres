@@ -632,6 +632,28 @@ DefineIndex(ParseState *pstate,
 		concurrent = false;
 
 	/*
+	 * CONCURRENTLY and WITH NO DATA are contradictory: the former exists to
+	 * build the index without blocking writers, the latter to not build it at
+	 * all.  Accepting both would mean silently ignoring one of them.
+	 *
+	 * Note we test stmt->concurrent rather than 'concurrent', so that the
+	 * error is thrown for temporary tables too, where CONCURRENTLY is
+	 * downgraded above.  Being consistent seems better than accepting the
+	 * combination in one place and rejecting it in another.
+	 */
+	if (stmt->concurrent && stmt->nodata)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot create index CONCURRENTLY WITH NO DATA"),
+				 errhint("Use REINDEX INDEX CONCURRENTLY to populate the index later.")));
+
+	/* Constraint DDL has no way to spell the clause. */
+	if (stmt->nodata && stmt->isconstraint)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("constraint indexes cannot be created WITH NO DATA")));
+
+	/*
 	 * Start progress report.  If we're building a partition, this was already
 	 * done.
 	 */
@@ -682,6 +704,14 @@ DefineIndex(ParseState *pstate,
 	 * index build; but for concurrent builds we allow INSERT/UPDATE/DELETE
 	 * (but not VACUUM).
 	 *
+	 * WITH NO DATA builds nothing, and the index it leaves behind holds no
+	 * entries and is not maintained, so there is nothing a concurrent writer
+	 * could do that the index would miss.  Take the weaker lock there too.
+	 * Holding ShareLock would be brief, but acquiring it would not: the
+	 * command would wait behind every open writer, and queue new writers
+	 * behind itself while it waited, which is the cost the clause exists to
+	 * avoid.
+	 *
 	 * NB: Caller is responsible for making sure that tableId refers to the
 	 * relation on which the index should be built; except in bootstrap mode,
 	 * this will typically require the caller to have already locked the
@@ -692,7 +722,7 @@ DefineIndex(ParseState *pstate,
 	 * parallel workers under the control of certain particular ambuild
 	 * functions will need to be updated, too.
 	 */
-	lockmode = concurrent ? ShareUpdateExclusiveLock : ShareLock;
+	lockmode = (concurrent || stmt->nodata) ? ShareUpdateExclusiveLock : ShareLock;
 	rel = table_open(tableId, lockmode);
 
 	/*
@@ -728,6 +758,20 @@ DefineIndex(ParseState *pstate,
 					 errdetail_relkind_not_supported(rel->rd_rel->relkind)));
 			break;
 	}
+
+	/*
+	 * Refuse a no-data index on a system catalog, even under
+	 * allow_system_table_mods.  Catalog scans reach their indexes directly
+	 * via systable_beginscan(), which does not consult indisvalid or
+	 * indisready, so an unpopulated catalog index would silently return wrong
+	 * answers rather than merely being ignored.  TOAST relations are already
+	 * excluded by the relkind check above.
+	 */
+	if (stmt->nodata && IsSystemRelation(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot create index on system catalog \"%s\" WITH NO DATA",
+						RelationGetRelationName(rel))));
 
 	/*
 	 * Establish behavior for partitioned tables, and verify sanity of
@@ -1247,8 +1291,18 @@ DefineIndex(ParseState *pstate,
 	flags = constr_flags = 0;
 	if (stmt->isconstraint)
 		flags |= INDEX_CREATE_ADD_CONSTRAINT;
-	if (skip_build || concurrent || partitioned)
+	if (skip_build || concurrent || partitioned || stmt->nodata)
 		flags |= INDEX_CREATE_SKIP_BUILD;
+
+	/*
+	 * A partitioned index is not itself marked as having no data: it has no
+	 * storage, so there is nothing about it left unbuilt.  It is the indexes
+	 * on the partitions that are, and the partitioned index is invalid until
+	 * they are populated, by the same rule that governs any other partitioned
+	 * index whose children are not yet valid.
+	 */
+	if (stmt->nodata && !partitioned)
+		flags |= INDEX_CREATE_NO_DATA;
 	if (stmt->if_not_exists)
 		flags |= INDEX_CREATE_IF_NOT_EXISTS;
 	if (concurrent)
@@ -1545,6 +1599,15 @@ DefineIndex(ParseState *pstate,
 														parentIndex,
 														attmap,
 														NULL);
+
+					/*
+					 * generateClonedIndexStmt() reconstructs the statement
+					 * from the parent index, which does not record that the
+					 * original said WITH NO DATA, so carry that down
+					 * ourselves.  Each partition's index is what the clause
+					 * is actually about.
+					 */
+					childStmt->nodata = stmt->nodata;
 
 					/*
 					 * Recurse as the starting user ID.  Callee will use that
