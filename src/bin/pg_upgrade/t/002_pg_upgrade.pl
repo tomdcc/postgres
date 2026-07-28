@@ -428,6 +428,23 @@ push(@dump_command, '--extra-float-digits', '0')
   if ($oldnode->pg_version < 12);
 $newnode->command_ok(\@dump_command, 'dump before running pg_upgrade');
 
+# Count indexes created WITH NO DATA, while the old cluster is still running.
+# pg_upgrade must carry them over still unpopulated, and the dump comparison at
+# the end cannot detect a regression there, because a plain dump deliberately
+# renders a no-data index and a populated one identically.  The fixture comes
+# from the regression suite, which leaves such indexes behind in
+# create_index.sql.
+my $nodata_before = 0;
+if (!defined($ENV{olddump})
+	&& $oldnode->safe_psql(
+		'regression', "SELECT count(*) FROM pg_attribute
+		   WHERE attrelid = 'pg_catalog.pg_index'::regclass
+		     AND attname = 'indisnodata'") eq '1')
+{
+	$nodata_before = $oldnode->safe_psql('regression',
+		"SELECT count(*) FROM pg_index WHERE indisnodata");
+}
+
 # After dumping, update references to the old source tree's regress.so
 # to point to the new tree.
 if (defined($ENV{oldinstall}))
@@ -682,6 +699,25 @@ $result = $newnode->safe_psql(
 is( $result,
 	"$original_encoding|$original_provider|$original_datcollate|$original_datctype|$original_datlocale",
 	"check that locales in new cluster match original cluster");
+
+# Check that the no-data indexes counted before the upgrade are still
+# unpopulated, and genuinely empty rather than merely flagged.
+if ($nodata_before > 0)
+{
+	is( $newnode->safe_psql(
+			'regression', "SELECT count(*) FROM pg_index WHERE indisnodata"),
+		$nodata_before,
+		'no-data indexes remain unpopulated after pg_upgrade');
+
+	is( $newnode->safe_psql(
+			'regression', q{
+			SELECT count(*) FROM pg_index i
+			  WHERE i.indisnodata
+			    AND (i.indisvalid OR i.indisready
+			         OR pg_relation_size(i.indexrelid) > 0)}),
+		'0',
+		'upgraded no-data indexes are invalid, not ready and empty');
+}
 
 # Second dump from the upgraded instance.
 @dump_command = (

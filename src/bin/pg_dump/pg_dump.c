@@ -7793,6 +7793,7 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 				i_indkey,
 				i_indisclustered,
 				i_indisreplident,
+				i_indisnodata,
 				i_indnullsnotdistinct,
 				i_contype,
 				i_conname,
@@ -7867,6 +7868,13 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 	appendPQExpBufferStr(query,
 						 "i.indisreplident, ");
 
+	if (fout->remoteVersion >= 200000)
+		appendPQExpBufferStr(query,
+							 "i.indisnodata, ");
+	else
+		appendPQExpBufferStr(query,
+							 "false AS indisnodata, ");
+
 	if (fout->remoteVersion >= 110000)
 		appendPQExpBufferStr(query,
 							 "inh.inhparent AS parentidx, "
@@ -7913,6 +7921,13 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 	 */
 	if (fout->remoteVersion >= 110000)
 	{
+		/*
+		 * An index created WITH NO DATA has neither indisvalid nor
+		 * indisready, so it must bypass both conjuncts to be dumped at all.
+		 * Unlike an invalid index -- which is a crash artifact of unknown
+		 * provenance, and is deliberately omitted -- it is a definition the
+		 * user asked for, so it belongs in the dump.
+		 */
 		appendPQExpBuffer(query,
 						  "FROM unnest('%s'::pg_catalog.oid[]) AS src(tbloid)\n"
 						  "JOIN pg_catalog.pg_index i ON (src.tbloid = i.indrelid) "
@@ -7924,10 +7939,14 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 						  "c.contype IN ('p','u','x')) "
 						  "LEFT JOIN pg_catalog.pg_inherits inh "
 						  "ON (inh.inhrelid = indexrelid) "
-						  "WHERE (i.indisvalid OR t2.relkind = 'p') "
-						  "AND i.indisready "
+						  "WHERE (i.indisvalid OR t2.relkind = 'p'%s) "
+						  "AND (i.indisready%s) "
 						  "ORDER BY i.indrelid, indexname",
-						  tbloids->data);
+						  tbloids->data,
+						  fout->remoteVersion >= 200000 ?
+						  " OR i.indisnodata" : "",
+						  fout->remoteVersion >= 200000 ?
+						  " OR i.indisnodata" : "");
 	}
 	else
 	{
@@ -7967,6 +7986,7 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 	i_indkey = PQfnumber(res, "indkey");
 	i_indisclustered = PQfnumber(res, "indisclustered");
 	i_indisreplident = PQfnumber(res, "indisreplident");
+	i_indisnodata = PQfnumber(res, "indisnodata");
 	i_indnullsnotdistinct = PQfnumber(res, "indnullsnotdistinct");
 	i_contype = PQfnumber(res, "contype");
 	i_conname = PQfnumber(res, "conname");
@@ -8052,6 +8072,7 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 												indxinfo[j].indnattrs);
 			indxinfo[j].indisclustered = (PQgetvalue(res, j, i_indisclustered)[0] == 't');
 			indxinfo[j].indisreplident = (PQgetvalue(res, j, i_indisreplident)[0] == 't');
+			indxinfo[j].indisnodata = (PQgetvalue(res, j, i_indisnodata)[0] == 't');
 			indxinfo[j].indnullsnotdistinct = (PQgetvalue(res, j, i_indnullsnotdistinct)[0] == 't');
 			indxinfo[j].parentidx = atooid(PQgetvalue(res, j, i_parentidx));
 			indxinfo[j].partattaches = (SimplePtrList)
