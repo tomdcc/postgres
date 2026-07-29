@@ -3952,6 +3952,29 @@ get_index_isvalid(Oid index_oid)
 }
 
 /*
+ * get_index_isnodata
+ *
+ *		Given the index OID, return pg_index.indisnodata.
+ */
+bool
+get_index_isnodata(Oid index_oid)
+{
+	bool		isnodata;
+	HeapTuple	tuple;
+	Form_pg_index rd_index;
+
+	tuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(index_oid));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for index %u", index_oid);
+
+	rd_index = (Form_pg_index) GETSTRUCT(tuple);
+	isnodata = rd_index->indisnodata;
+	ReleaseSysCache(tuple);
+
+	return isnodata;
+}
+
+/*
  * get_index_isclustered
  *
  *		Given the index OID, return pg_index.indisclustered.

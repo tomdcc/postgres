@@ -1297,6 +1297,14 @@ index_create(Relation heapRelation,
 						   -1.0);
 		/* Make the above update visible */
 		CommandCounterIncrement();
+
+		/*
+		 * A no-data index has no later caller to fill it in, so if it is
+		 * unlogged we must write its init fork ourselves; every other
+		 * skip-build caller reaches index_build() eventually.
+		 */
+		if (nodata)
+			index_write_init_fork(indexRelation);
 	}
 	else
 	{
@@ -3042,6 +3050,44 @@ index_update_stats(Relation rel,
 
 
 /*
+ * index_write_init_fork - write an unlogged index's init fork, if needed
+ *
+ * Every unlogged relation has a WAL-logged init fork, and that is the whole
+ * of its durability story: RelationCreateStorage() creates only the main
+ * fork, and does not WAL-log it for an unlogged relation.  Recovery resets
+ * such a relation from its init fork.
+ *
+ * We must first check whether one already exists.  If, for example, an
+ * unlogged relation is truncated in the transaction that created it, or
+ * truncated twice in a subsequent transaction, the relfilenumber won't
+ * change, and nothing needs to be done here.
+ *
+ * This is normally reached from index_build(), once ambuild() has run.  It is
+ * also called on the paths that deliberately leave an index unbuilt -- an
+ * index created WITH NO DATA, and one re-storaged but not rebuilt by
+ * reindex_relation() -- so that such an index is structurally identical to
+ * every other unlogged index, and the recovery path needs no special case for
+ * it.  ambuildempty is mandatory for every index AM (asserted in
+ * index_build), so this is always callable.
+ *
+ * Note that ambuildempty writes a valid empty index rather than leaving a
+ * zero-length file; that is the same on-disk shape TRUNCATE leaves behind,
+ * and a no-data index is still semantically empty because indisnodata,
+ * indisvalid and indisready say so.
+ */
+void
+index_write_init_fork(Relation indexRelation)
+{
+	if (indexRelation->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED &&
+		!smgrexists(RelationGetSmgr(indexRelation), INIT_FORKNUM))
+	{
+		smgrcreate(RelationGetSmgr(indexRelation), INIT_FORKNUM, false);
+		log_smgrcreate(&indexRelation->rd_locator, INIT_FORKNUM);
+		indexRelation->rd_indam->ambuildempty(indexRelation);
+	}
+}
+
+/*
  * index_build - invoke access-method-specific index build procedure
  *
  * On entry, the index's catalog entries are valid, and its physical disk
@@ -3143,18 +3189,9 @@ index_build(Relation heapRelation,
 
 	/*
 	 * If this is an unlogged index, we may need to write out an init fork for
-	 * it -- but we must first check whether one already exists.  If, for
-	 * example, an unlogged relation is truncated in the transaction that
-	 * created it, or truncated twice in a subsequent transaction, the
-	 * relfilenumber won't change, and nothing needs to be done here.
+	 * it.
 	 */
-	if (indexRelation->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED &&
-		!smgrexists(RelationGetSmgr(indexRelation), INIT_FORKNUM))
-	{
-		smgrcreate(RelationGetSmgr(indexRelation), INIT_FORKNUM, false);
-		log_smgrcreate(&indexRelation->rd_locator, INIT_FORKNUM);
-		indexRelation->rd_indam->ambuildempty(indexRelation);
-	}
+	index_write_init_fork(indexRelation);
 
 	/*
 	 * If we found any potentially broken HOT chains, mark the index as not
@@ -4127,6 +4164,61 @@ reindex_relation(const ReindexStmt *stmt, Oid relid, int flags,
 			 * as it is skipped here due to the hard failure that would happen
 			 * in reindex_index(), should we try to process it.
 			 */
+			if (flags & REINDEX_REL_SUPPRESS_INDEX_USE)
+				RemoveReindexPending(indexOid);
+			continue;
+		}
+
+		/*
+		 * Skip an index that was created WITH NO DATA and has not been
+		 * populated yet.  Only a command that names the index populates it;
+		 * commands that process every index of a relation leave it alone,
+		 * whether rebuilding indexes is their purpose (REINDEX TABLE) or a
+		 * side effect (VACUUM FULL, CLUSTER, REPACK, TRUNCATE, ALTER TABLE
+		 * rewrites).
+		 *
+		 * The danger a bulk operation must avoid is failing wholesale because
+		 * one unique index turns out to sit over non-unique data -- which is
+		 * exactly what a never-populated unique index might do.  Beyond that,
+		 * a rewrite's duration must not depend on whether a no-data index
+		 * happens to exist on the table, or the promise that the user chooses
+		 * when the expensive build happens is worthless.
+		 *
+		 * Note this must live here rather than in reindex_index(): the
+		 * targeted forms reach reindex_index() without passing through this
+		 * function, including ReindexPartitions() fanning REINDEX INDEX out
+		 * over the leaves of a partitioned index, which is supposed to
+		 * populate them.
+		 *
+		 * "Skip" is not "leave untouched".  A rewrite still needs the index
+		 * to end up with storage of the new heap's persistence, since
+		 * finish_heap_swap() passes REINDEX_REL_FORCE_INDEXES_UNLOGGED or
+		 * _PERMANENT for precisely that reason; otherwise ALTER TABLE ... SET
+		 * UNLOGGED would leave a wrongly-persisted index behind.  So give it
+		 * fresh, empty, correctly-persisted storage and stop there: no
+		 * index_build(), and no flag update.  That is strictly less work than
+		 * rebuilding it.
+		 */
+		if (get_index_isnodata(indexOid))
+		{
+			Relation	iRel = index_open(indexOid, AccessExclusiveLock);
+
+			RelationSetNewRelfilenumber(iRel, persistence);
+			index_write_init_fork(iRel);
+			index_close(iRel, NoLock);
+
+			/*
+			 * Warn only if the user actually asked for a REINDEX.  A warning
+			 * on every vacuum of a table that happens to carry a no-data
+			 * index would be pure noise.
+			 */
+			if (stmt != NULL)
+				ereport(WARNING,
+						(errmsg("skipping reindex of index \"%s.%s\" created WITH NO DATA",
+								get_namespace_name(indexNamespaceId),
+								get_rel_name(indexOid)),
+						 errhint("Use REINDEX INDEX to populate it.")));
+
 			if (flags & REINDEX_REL_SUPPRESS_INDEX_USE)
 				RemoveReindexPending(indexOid);
 			continue;

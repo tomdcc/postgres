@@ -147,6 +147,8 @@ extern void FormIndexDatum(IndexInfo *indexInfo,
 						   Datum *values,
 						   bool *isnull);
 
+extern void index_write_init_fork(Relation indexRelation);
+
 extern void index_build(Relation heapRelation,
 						Relation indexRelation,
 						IndexInfo *indexInfo,

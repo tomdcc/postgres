@@ -16550,6 +16550,19 @@ RebuildConstraintComment(AlteredTableInfo *tab, AlterTablePass pass, Oid objid,
 static void
 TryReuseIndex(Oid oldId, IndexStmt *stmt)
 {
+	/*
+	 * Never reuse a no-data index's storage.  A valid stmt->oldNumber makes
+	 * DefineIndex() skip the build, but index_create() would still mark the
+	 * result valid and ready -- a planner-visible index over the old index's
+	 * empty storage, which is silent wrong answers rather than merely a lost
+	 * flag.  The regenerated statement carries WITH NO DATA, so declining
+	 * here gets the index recreated with fresh empty storage and the right
+	 * flags, consistent with the rewrite paths leaving such an index
+	 * unpopulated.
+	 */
+	if (get_index_isnodata(oldId))
+		return;
+
 	if (CheckIndexCompatible(oldId,
 							 stmt->accessMethod,
 							 stmt->indexParams,
@@ -21420,8 +21433,14 @@ AttachPartitionEnsureIndexes(List **wqueue, Relation rel, Relation attachrel)
 			if (attachrelIdxRels[i]->rd_rel->relispartition)
 				continue;
 
-			/* If this index is invalid, can't use it */
-			if (!attachrelIdxRels[i]->rd_index->indisvalid)
+			/*
+			 * An invalid index cannot be used, except that one created WITH
+			 * NO DATA is dealt with below, once we know whether it is even a
+			 * match: an index over unrelated columns says nothing about what
+			 * the user intended for this one.
+			 */
+			if (!attachrelIdxRels[i]->rd_index->indisvalid &&
+				!attachrelIdxRels[i]->rd_index->indisnodata)
 				continue;
 
 			if (CompareIndexInfo(attachInfos[i], info,
@@ -21451,6 +21470,36 @@ AttachPartitionEnsureIndexes(List **wqueue, Relation rel, Relation attachrel)
 						get_constraint_type(cldConstrOid))
 						continue;
 				}
+
+				/*
+				 * A matching index created WITH NO DATA is evidence that the
+				 * user did not want this index built now: that is the only
+				 * thing the clause means.  Attaching it is therefore the
+				 * right answer where it costs nothing, which is whenever the
+				 * index being attached to is itself invalid already -- it
+				 * cannot be made worse, and an invalid partitioned index
+				 * implies every index above it is invalid too, so nothing
+				 * further up is affected either.
+				 *
+				 * Where the parent index is valid, neither available outcome
+				 * can be chosen quietly.  Attaching would demote it, which no
+				 * other path in the system does; building a duplicate would
+				 * perform exactly the index build the user arranged to avoid,
+				 * during ALTER TABLE and under its locks, and leave the
+				 * original behind unattached.  Refuse, and let them say which
+				 * they want.
+				 */
+				if (attachrelIdxRels[i]->rd_index->indisnodata &&
+					idxRel->rd_index->indisvalid)
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("cannot attach index \"%s\", which has no data, to index \"%s\"",
+									RelationGetRelationName(attachrelIdxRels[i]),
+									RelationGetRelationName(idxRel)),
+							 errdetail("Index \"%s\" is valid, and attaching an index with no data to it would make it invalid.",
+									   RelationGetRelationName(idxRel)),
+							 errhint("Populate \"%s\" with REINDEX INDEX before attaching the partition, or drop it to have a new index built.",
+									 RelationGetRelationName(attachrelIdxRels[i]))));
 
 				/* bingo. */
 				IndexSetParentIndex(attachrelIdxRels[i], idx);
