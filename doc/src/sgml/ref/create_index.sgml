@@ -817,6 +817,9 @@ Indexes:
     <function>pg_get_indexdef</function> includes the
     <literal>WITH NO DATA</literal> clause until the index is populated, so the
     reconstructed definition always reflects the index's current state.
+    <link linkend="app-psql"><application>psql</application></link>'s
+    <command>\d</command> reports the state in place of the
+    <literal>INVALID</literal> marking such an index would otherwise carry.
    </para>
 
    <para>

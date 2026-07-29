@@ -1894,3 +1894,16 @@ SELECT pg_get_replica_identity_index('nodata_ri'::regclass) AS in_use;
 \d nodata_ri
 DROP TABLE nodata_ri;
 
+-- psql renders the no-data state instead of INVALID, since a no-data index is
+-- invalid but is not a crashed CREATE INDEX CONCURRENTLY.
+CREATE TABLE nodata_psql (a int, b text);
+CREATE INDEX nodata_psql_idx ON nodata_psql (a) WITH NO DATA;
+CREATE UNIQUE INDEX nodata_psql_uidx ON nodata_psql (b) WITH NO DATA;
+CREATE INDEX nodata_psql_ok ON nodata_psql (a);
+\d nodata_psql
+\d nodata_psql_idx
+\d nodata_psql_uidx
+-- and stops rendering it once the index is populated
+REINDEX INDEX nodata_psql_idx;
+\d nodata_psql_idx
+DROP TABLE nodata_psql;
