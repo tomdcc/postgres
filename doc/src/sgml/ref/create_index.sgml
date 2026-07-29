@@ -769,6 +769,16 @@ Indexes:
    </para>
 
    <para>
+    Only a command that names the index populates it.  Commands that process
+    every index of a table &mdash; <command>REINDEX TABLE</command>,
+    <command>REINDEX SCHEMA</command>, <command>REINDEX DATABASE</command>, and
+    the index rebuilds performed as a side effect by
+    <command>VACUUM FULL</command>, <command>CLUSTER</command>,
+    <command>REPACK</command>, <command>TRUNCATE</command> and table-rewriting
+    forms of <command>ALTER TABLE</command> &mdash; leave it unpopulated.
+   </para>
+
+   <para>
     On a partitioned table, <literal>WITH NO DATA</literal> defers the build of
     the index on each partition.  The partitioned index itself is not marked as
     having no data, having no storage of its own; it is invalid until its
@@ -785,6 +795,14 @@ Indexes:
     PARTITION</command></link>.  Note that populating it does not by itself
     re-check the partitioned index above it, so populate it before attaching if
     that index is to become valid as a result.
+   </para>
+
+   <para>
+    <link linkend="sql-altertable"><command>ALTER TABLE ... ATTACH
+    PARTITION</command></link> likewise attaches a matching index created this
+    way, provided the index it would be attached to is itself invalid; if that
+    index is valid, an error is raised rather than either invalidating it or
+    building a replacement.
    </para>
 
    <para>

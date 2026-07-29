@@ -3623,7 +3623,11 @@ RelationTruncateIndexes(Relation heapRelation)
 		 */
 		RelationTruncate(currentIndex, 0);
 
-		/* Initialize the index and rebuild */
+		/*
+		 * Initialize the index and rebuild.  An index created WITH NO DATA is
+		 * included: index_build() on the now-empty heap writes it an empty
+		 * index and changes no flags, so it stays unpopulated.
+		 */
 		/* Note: we do not need to re-establish pkey setting */
 		index_build(heapRelation, currentIndex, indexInfo, true, false,
 					true);
