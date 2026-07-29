@@ -1062,7 +1062,12 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       already exists in the partition, it will be attached to the target
       table's index, as if ALTER INDEX ATTACH PARTITION had been executed;
       otherwise, a new corresponding index will be created.  Invalid indexes
-      on the partition are skipped.
+      on the partition are skipped.  An index created with
+      <link linkend="sql-createindex-with-no-data"><literal>WITH NO
+      DATA</literal></link> is attached if the index it would be attached to is
+      itself invalid, and otherwise reported as an error, since attaching it
+      would make that index invalid and building a replacement would perform
+      the index build it was created to defer.
       Note that if the existing table is a foreign table, it is currently not
       allowed to attach the table as a partition of the target table if there
       are <literal>UNIQUE</literal> indexes on the target table.  (See also

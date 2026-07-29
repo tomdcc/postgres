@@ -3746,3 +3746,220 @@ CREATE INDEX nodata_withdata_idx ON nodata_tab (a) WITH DATA;
 ERROR:  syntax error at or near "DATA"
 LINE 1: ...REATE INDEX nodata_withdata_idx ON nodata_tab (a) WITH DATA;
                                                                   ^
+-- Only a command that names a no-data index populates it.  Table rewrites
+-- give it fresh, correctly-persisted storage and stop there, silently.
+CREATE INDEX nodata_ok_idx ON nodata_tab (a);
+VACUUM FULL nodata_tab;
+CLUSTER nodata_tab USING nodata_ok_idx;
+TRUNCATE nodata_tab;
+SELECT indexrelid::regclass, indisnodata, indisvalid, indisready
+  FROM pg_index WHERE indrelid = 'nodata_tab'::regclass ORDER BY 1;
+     indexrelid     | indisnodata | indisvalid | indisready 
+--------------------+-------------+------------+------------
+ nodata_idx         | t           | f          | f
+ nodata_uidx        | t           | f          | f
+ nodata_partial_idx | t           | f          | f
+ nodata_ok_idx      | f           | t          | t
+(4 rows)
+
+-- but a bulk REINDEX says so, since the user did ask for a reindex
+REINDEX TABLE nodata_tab;
+WARNING:  skipping reindex of index "public.nodata_idx" created WITH NO DATA
+HINT:  Use REINDEX INDEX to populate it.
+WARNING:  skipping reindex of index "public.nodata_uidx" created WITH NO DATA
+HINT:  Use REINDEX INDEX to populate it.
+WARNING:  skipping reindex of index "public.nodata_partial_idx" created WITH NO DATA
+HINT:  Use REINDEX INDEX to populate it.
+REINDEX TABLE CONCURRENTLY nodata_tab;
+WARNING:  skipping reindex of index "public.nodata_idx" created WITH NO DATA
+HINT:  Use REINDEX INDEX to populate it.
+WARNING:  skipping reindex of index "public.nodata_uidx" created WITH NO DATA
+HINT:  Use REINDEX INDEX to populate it.
+WARNING:  skipping reindex of index "public.nodata_partial_idx" created WITH NO DATA
+HINT:  Use REINDEX INDEX to populate it.
+SELECT indexrelid::regclass, indisnodata FROM pg_index
+  WHERE indrelid = 'nodata_tab'::regclass ORDER BY 1;
+     indexrelid     | indisnodata 
+--------------------+-------------
+ nodata_idx         | t
+ nodata_uidx        | t
+ nodata_partial_idx | t
+ nodata_ok_idx      | f
+(4 rows)
+
+-- REINDEX SCHEMA reaches reindex_relation() by a different route, so check it
+-- warns and skips too.  (REINDEX DATABASE shares that route, but reindexing
+-- the whole regression database is not something to do from here.)
+CREATE SCHEMA nodata_schema;
+CREATE TABLE nodata_schema.tab (a int);
+INSERT INTO nodata_schema.tab SELECT generate_series(1, 100);
+CREATE INDEX tab_nodata ON nodata_schema.tab (a) WITH NO DATA;
+REINDEX SCHEMA nodata_schema;
+WARNING:  skipping reindex of index "nodata_schema.tab_nodata" created WITH NO DATA
+HINT:  Use REINDEX INDEX to populate it.
+REINDEX SCHEMA CONCURRENTLY nodata_schema;
+WARNING:  skipping reindex of index "nodata_schema.tab_nodata" created WITH NO DATA
+HINT:  Use REINDEX INDEX to populate it.
+SELECT indexrelid::regclass, indisnodata, indisvalid, indisready
+  FROM pg_index WHERE indrelid = 'nodata_schema.tab'::regclass;
+        indexrelid        | indisnodata | indisvalid | indisready 
+--------------------------+-------------+------------+------------
+ nodata_schema.tab_nodata | t           | f          | f
+(1 row)
+
+DROP SCHEMA nodata_schema CASCADE;
+NOTICE:  drop cascades to table nodata_schema.tab
+-- ALTER TABLE ... ALTER COLUMN TYPE must not complete it, on either branch.
+-- varchar(10) -> varchar(20) reuses the storage; int -> bigint rewrites.
+CREATE TABLE nodata_alter (a int, b varchar(10));
+CREATE INDEX nodata_alter_a ON nodata_alter (a) WITH NO DATA;
+CREATE INDEX nodata_alter_b ON nodata_alter (b) WITH NO DATA;
+ALTER TABLE nodata_alter ALTER COLUMN b TYPE varchar(20);
+SELECT indexrelid::regclass, indisnodata, indisvalid, indisready
+  FROM pg_index WHERE indrelid = 'nodata_alter'::regclass ORDER BY 1;
+   indexrelid   | indisnodata | indisvalid | indisready 
+----------------+-------------+------------+------------
+ nodata_alter_a | t           | f          | f
+ nodata_alter_b | t           | f          | f
+(2 rows)
+
+ALTER TABLE nodata_alter ALTER COLUMN a TYPE bigint;
+SELECT indexrelid::regclass, indisnodata, indisvalid, indisready,
+       pg_relation_size(indexrelid) AS size
+  FROM pg_index WHERE indrelid = 'nodata_alter'::regclass ORDER BY 1;
+   indexrelid   | indisnodata | indisvalid | indisready | size 
+----------------+-------------+------------+------------+------
+ nodata_alter_b | t           | f          | f          |    0
+ nodata_alter_a | t           | f          | f          |    0
+(2 rows)
+
+-- A rewrite rebuilds every index on the table, not just those on the column
+-- being altered, so a no-data index has to survive one it has nothing to do
+-- with.  The ordinary index alongside it is what shows the rewrite happened.
+CREATE TABLE nodata_unrel (a int, b text, c int);
+CREATE INDEX nodata_unrel_a ON nodata_unrel (a) WITH NO DATA;
+CREATE INDEX nodata_unrel_c ON nodata_unrel (c);
+ALTER TABLE nodata_unrel ALTER COLUMN b TYPE varchar(100);
+SELECT indexrelid::regclass, indisnodata, indisvalid, indisready,
+       pg_relation_size(indexrelid) AS size
+  FROM pg_index WHERE indrelid = 'nodata_unrel'::regclass ORDER BY 1;
+   indexrelid   | indisnodata | indisvalid | indisready | size 
+----------------+-------------+------------+------------+------
+ nodata_unrel_a | t           | f          | f          |    0
+ nodata_unrel_c | f           | t          | t          | 8192
+(2 rows)
+
+DROP TABLE nodata_unrel;
+-- index persistence must still track the heap's across SET UNLOGGED/LOGGED
+ALTER TABLE nodata_alter SET UNLOGGED;
+SELECT relname, relpersistence FROM pg_class
+  WHERE relname LIKE 'nodata_alter%' ORDER BY 1;
+    relname     | relpersistence 
+----------------+----------------
+ nodata_alter   | u
+ nodata_alter_a | u
+ nodata_alter_b | u
+(3 rows)
+
+ALTER TABLE nodata_alter SET LOGGED;
+SELECT relname, relpersistence FROM pg_class
+  WHERE relname LIKE 'nodata_alter%' ORDER BY 1;
+    relname     | relpersistence 
+----------------+----------------
+ nodata_alter   | p
+ nodata_alter_a | p
+ nodata_alter_b | p
+(3 rows)
+
+DROP TABLE nodata_alter;
+-- ALTER TABLE ... ATTACH PARTITION adopts a matching no-data index when the
+-- index it would attach to is itself already invalid: nothing is demoted, and
+-- the build the user arranged to avoid does not happen.
+CREATE TABLE nodata_parted (a int) PARTITION BY RANGE (a);
+CREATE TABLE nodata_part0 PARTITION OF nodata_parted FOR VALUES FROM (0) TO (100);
+CREATE INDEX nodata_parted_idx ON ONLY nodata_parted (a);
+CREATE TABLE nodata_part1 (a int);
+CREATE INDEX nodata_part1_idx ON nodata_part1 (a) WITH NO DATA;
+ALTER TABLE nodata_parted ATTACH PARTITION nodata_part1 FOR VALUES FROM (100) TO (200);
+SELECT c.relname, i.indisnodata, i.indisvalid, c.relispartition,
+       pg_relation_size(i.indexrelid) AS size
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid IN ('nodata_parted'::regclass, 'nodata_part0'::regclass,
+                       'nodata_part1'::regclass) ORDER BY 1;
+      relname      | indisnodata | indisvalid | relispartition | size 
+-------------------+-------------+------------+----------------+------
+ nodata_part1_idx  | t           | f          | t              |    0
+ nodata_parted_idx | f           | f          | f              |    0
+(2 rows)
+
+DROP TABLE nodata_parted;
+-- but not when that index is valid, since attaching would invalidate it and
+-- building a duplicate would perform the very build being deferred
+CREATE TABLE nodata_parted (a int) PARTITION BY RANGE (a);
+CREATE TABLE nodata_part0 PARTITION OF nodata_parted FOR VALUES FROM (0) TO (100);
+CREATE INDEX nodata_parted_idx ON nodata_parted (a);
+CREATE TABLE nodata_part1 (a int);
+CREATE INDEX nodata_part1_idx ON nodata_part1 (a) WITH NO DATA;
+ALTER TABLE nodata_parted ATTACH PARTITION nodata_part1 FOR VALUES FROM (100) TO (200);
+ERROR:  cannot attach index "nodata_part1_idx", which has no data, to index "nodata_parted_idx"
+DETAIL:  Index "nodata_parted_idx" is valid, and attaching an index with no data to it would make it invalid.
+HINT:  Populate "nodata_part1_idx" with REINDEX INDEX before attaching the partition, or drop it to have a new index built.
+-- populating it resolves the matter
+REINDEX INDEX nodata_part1_idx;
+ALTER TABLE nodata_parted ATTACH PARTITION nodata_part1 FOR VALUES FROM (100) TO (200);
+ERROR:  cannot attach index "nodata_part1_idx", which has no data, to index "nodata_parted_idx"
+DETAIL:  Index "nodata_parted_idx" is valid, and attaching an index with no data to it would make it invalid.
+HINT:  Populate "nodata_part1_idx" with REINDEX INDEX before attaching the partition, or drop it to have a new index built.
+SELECT c.relname, i.indisnodata, i.indisvalid, c.relispartition
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid IN ('nodata_parted'::regclass, 'nodata_part0'::regclass,
+                       'nodata_part1'::regclass) ORDER BY 1;
+      relname       | indisnodata | indisvalid | relispartition 
+--------------------+-------------+------------+----------------
+ nodata_part0_a_idx | f           | t          | t
+ nodata_part1_idx   | t           | t          | f
+ nodata_parted_idx  | f           | t          | f
+(3 rows)
+
+DROP TABLE nodata_parted;
+-- a no-data index that does not match the parent index is not evidence of
+-- anything, and does not stand in the way
+CREATE TABLE nodata_parted (a int, b int) PARTITION BY RANGE (a);
+CREATE TABLE nodata_part0 PARTITION OF nodata_parted FOR VALUES FROM (0) TO (100);
+CREATE INDEX nodata_parted_idx ON nodata_parted (a);
+CREATE TABLE nodata_part1 (a int, b int);
+ERROR:  relation "nodata_part1" already exists
+CREATE INDEX nodata_part1_other ON nodata_part1 (b) WITH NO DATA;
+ERROR:  column "b" does not exist
+LINE 1: CREATE INDEX nodata_part1_other ON nodata_part1 (b) WITH NO ...
+                                                         ^
+ALTER TABLE nodata_parted ATTACH PARTITION nodata_part1 FOR VALUES FROM (100) TO (200);
+ERROR:  child table is missing column "b"
+SELECT c.relname, i.indisnodata, i.indisvalid, c.relispartition
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid IN ('nodata_parted'::regclass, 'nodata_part0'::regclass,
+                       'nodata_part1'::regclass) ORDER BY 1;
+      relname       | indisnodata | indisvalid | relispartition 
+--------------------+-------------+------------+----------------
+ nodata_part0_a_idx | f           | t          | t
+ nodata_part1_idx   | t           | t          | f
+ nodata_parted_idx  | f           | t          | f
+(3 rows)
+
+DROP TABLE nodata_parted;
+-- ALTER INDEX ... ATTACH PARTITION does allow it, leaving the parent invalid
+CREATE TABLE nodata_parted2 (a int) PARTITION BY RANGE (a);
+CREATE TABLE nodata_part2 PARTITION OF nodata_parted2 FOR VALUES FROM (0) TO (100);
+CREATE INDEX nodata_part2_idx ON nodata_part2 (a) WITH NO DATA;
+CREATE INDEX nodata_parted2_idx ON ONLY nodata_parted2 (a);
+ALTER INDEX nodata_parted2_idx ATTACH PARTITION nodata_part2_idx;
+SELECT c.relname, i.indisnodata, i.indisvalid
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE c.relname IN ('nodata_parted2_idx', 'nodata_part2_idx') ORDER BY 1;
+      relname       | indisnodata | indisvalid 
+--------------------+-------------+------------
+ nodata_part2_idx   | t           | f
+ nodata_parted2_idx | f           | f
+(2 rows)
+
+DROP TABLE nodata_parted2;

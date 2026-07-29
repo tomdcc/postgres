@@ -3921,7 +3921,20 @@ ReindexRelationConcurrently(const ReindexStmt *stmt, Oid relationOid, const Rein
 					Relation	indexRelation = index_open(cellOid,
 														   ShareUpdateExclusiveLock);
 
-					if (!indexRelation->rd_index->indisvalid)
+					/*
+					 * Test indisnodata before indisvalid, since a no-data
+					 * index is also invalid.  The invalid-index message is
+					 * actively misleading for one: it is not broken, and DROP
+					 * is the opposite of what the user wants.
+					 */
+					if (indexRelation->rd_index->indisnodata)
+						ereport(WARNING,
+								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+								 errmsg("skipping reindex of index \"%s.%s\" created WITH NO DATA",
+										get_namespace_name(get_rel_namespace(cellOid)),
+										get_rel_name(cellOid)),
+								 errhint("Use REINDEX INDEX to populate it.")));
+					else if (!indexRelation->rd_index->indisvalid)
 						ereport(WARNING,
 								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 								 errmsg("skipping reindex of invalid index \"%s.%s\"",

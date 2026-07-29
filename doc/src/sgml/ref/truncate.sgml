@@ -176,6 +176,13 @@ TRUNCATE [ TABLE ] [ ONLY ] <replaceable class="parameter">name</replaceable> [ 
    supported by the foreign data wrapper, for instance,
    see <xref linkend="postgres-fdw"/>.
   </para>
+
+  <para>
+   This command does not populate an index created with
+   <link linkend="sql-createindex-with-no-data"><command>CREATE INDEX ... WITH
+   NO DATA</command></link>.  Such an index stays unpopulated until a
+   <command>REINDEX</command> naming it explicitly builds it.
+  </para>
  </refsect1>
 
  <refsect1>
