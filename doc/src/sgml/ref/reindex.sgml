@@ -386,14 +386,12 @@ REINDEX [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] { DA
   </para>
 
   <para>
-   <command>REINDEX SCHEMA</command>, <command>REINDEX DATABASE</command> and
-   <command>REINDEX SYSTEM</command> do not perform this recheck, although they
-   do rebuild the indexes it would depend on: those forms process relations
-   that have storage, reaching each leaf partition directly, and never visit a
-   partitioned table or index.  A partitioned index left invalid by an earlier
-   failure is therefore not brought back to valid by them; use
-   <literal>VALIDITY_ONLY</literal> on it afterwards, or name the partitioned
-   index or table directly.
+   <command>REINDEX SCHEMA</command> and <command>REINDEX DATABASE</command>
+   recheck it as well, for the partitioned indexes within the schema or
+   database named.  Note that a partition may belong to a table in a different
+   schema, so <command>REINDEX SCHEMA</command> can rebuild a partition's index
+   without the partitioned index above it being in scope; that index is left
+   alone, and rechecking it requires naming its schema, or the index itself.
   </para>
 
   <para>

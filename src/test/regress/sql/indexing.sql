@@ -1281,6 +1281,85 @@ select indexrelid::regclass, indisvalid
 drop table parted_reind5_tab;
 drop function parted_reind5_f(int);
 
+-- REINDEX SCHEMA rechecks the partitioned indexes in the schema named, but
+-- stops at the schema boundary: a partition can live in a different schema
+-- from the table it belongs to.
+create schema parted_reind_sa;
+create schema parted_reind_sb;
+create function parted_reind_sa.f(int) returns int
+  immutable language sql as 'select $1 / 0';
+-- a tree wholly inside parted_reind_sa
+create table parted_reind_sa.t (a int) partition by range (a);
+create table parted_reind_sa.t1 partition of parted_reind_sa.t
+  for values from (1) to (10) partition by range (a);
+create table parted_reind_sa.t11 partition of parted_reind_sa.t1
+  for values from (1) to (5);
+insert into parted_reind_sa.t11 values (1);
+create index concurrently t11_idx
+  on parted_reind_sa.t11 (parted_reind_sa.f(a));
+create index t1_idx on only parted_reind_sa.t1 (parted_reind_sa.f(a));
+create index t_idx on only parted_reind_sa.t (parted_reind_sa.f(a));
+alter index parted_reind_sa.t1_idx attach partition parted_reind_sa.t11_idx;
+alter index parted_reind_sa.t_idx attach partition parted_reind_sa.t1_idx;
+-- and one whose parent index is in parted_reind_sb but partition in _sa
+create table parted_reind_sb.u (a int) partition by range (a);
+create table parted_reind_sa.u1 partition of parted_reind_sb.u
+  for values from (1) to (10);
+insert into parted_reind_sa.u1 values (1);
+create index concurrently u1_idx
+  on parted_reind_sa.u1 (parted_reind_sa.f(a));
+create index u_idx on only parted_reind_sb.u (parted_reind_sa.f(a));
+alter index parted_reind_sb.u_idx attach partition parted_reind_sa.u1_idx;
+create or replace function parted_reind_sa.f(int) returns int
+  immutable language sql as 'select $1';
+select c.relname, n.nspname, i.indisvalid
+  from pg_index i join pg_class c on c.oid = i.indexrelid
+       join pg_namespace n on n.oid = c.relnamespace
+  where n.nspname like 'parted_reind_s%'
+  order by c.relname collate "C";
+-- the wholly-contained tree is restored; the parent in the other schema is not
+reindex schema parted_reind_sa;
+select c.relname, n.nspname, i.indisvalid
+  from pg_index i join pg_class c on c.oid = i.indexrelid
+       join pg_namespace n on n.oid = c.relnamespace
+  where n.nspname like 'parted_reind_s%'
+  order by c.relname collate "C";
+-- naming the other schema brings it into scope
+reindex schema parted_reind_sb;
+select c.relname, n.nspname, i.indisvalid
+  from pg_index i join pg_class c on c.oid = i.indexrelid
+       join pg_namespace n on n.oid = c.relnamespace
+  where n.nspname like 'parted_reind_s%'
+  order by c.relname collate "C";
+drop schema parted_reind_sa cascade;
+drop schema parted_reind_sb cascade;
+
+-- The report follows the same rule here, but only once the passes have
+-- converged: an index passed over on one pass may be validated by the next.
+create schema parted_reind12;
+create function parted_reind12.f(int) returns int
+  immutable language sql as 'select $1 / 0';
+create table parted_reind12.t (a int) partition by range (a);
+create table parted_reind12.t1 partition of parted_reind12.t
+  for values from (1) to (10) partition by range (a);
+create table parted_reind12.t11 partition of parted_reind12.t1
+  for values from (1) to (5);
+-- a second partition of the top, which never acquires an index
+create table parted_reind12.t2 partition of parted_reind12.t
+  for values from (10) to (20);
+insert into parted_reind12.t11 values (1);
+create index concurrently t11_idx on parted_reind12.t11 (parted_reind12.f(a));
+create index t1_idx on only parted_reind12.t1 (parted_reind12.f(a));
+create index t_idx on only parted_reind12.t (parted_reind12.f(a));
+alter index parted_reind12.t1_idx attach partition parted_reind12.t11_idx;
+alter index parted_reind12.t_idx attach partition parted_reind12.t1_idx;
+create or replace function parted_reind12.f(int) returns int
+  immutable language sql as 'select $1';
+\set VERBOSITY terse \\ -- suppress machine-dependent details
+reindex (verbose) schema parted_reind12;
+\set VERBOSITY default
+drop schema parted_reind12 cascade;
+
 -- VALIDITY_ONLY is accepted for REINDEX INDEX only, and only on a
 -- partitioned index: an index with storage has no validity to recheck.
 create table parted_reind4_tab (a int) partition by range (a);
