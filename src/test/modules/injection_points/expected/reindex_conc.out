@@ -48,4 +48,74 @@ SELECT injection_points_detach('reindex-conc-index-not-safe');
 
 DROP TABLE reindex_inj.tbl;
 DROP SCHEMA reindex_inj;
+-- The swap commits two transactions before the old index is dropped, so a
+-- command that fails in between leaves the old index behind.  It must not be
+-- left marked as having no data: it will never be populated, and pg_dump, psql
+-- and a query looking for indexes awaiting a build would each take it for one
+-- the user deferred deliberately.
+SELECT injection_points_attach('reindex-relation-concurrently-before-set-dead', 'error');
+ injection_points_attach 
+-------------------------
+ 
+(1 row)
+
+CREATE TABLE reindex_nodata_tbl (i int);
+INSERT INTO reindex_nodata_tbl SELECT generate_series(1, 10);
+CREATE INDEX reindex_nodata_ind ON reindex_nodata_tbl (i) WITH NO DATA;
+REINDEX INDEX CONCURRENTLY reindex_nodata_ind;
+ERROR:  error triggered for injection point reindex-relation-concurrently-before-set-dead
+SELECT c.relname, i.indisready, i.indisvalid, i.indisnodata
+  FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid
+  WHERE c.relname LIKE 'reindex_nodata_ind%'
+  ORDER BY c.relname;
+         relname          | indisready | indisvalid | indisnodata 
+--------------------------+------------+------------+-------------
+ reindex_nodata_ind       | t          | t          | f
+ reindex_nodata_ind_ccold | f          | f          | f
+(2 rows)
+
+SELECT injection_points_detach('reindex-relation-concurrently-before-set-dead');
+ injection_points_detach 
+-------------------------
+ 
+(1 row)
+
+DROP TABLE reindex_nodata_tbl;
+-- The same applies to the other place an index's life ends without its row
+-- going away: DROP INDEX CONCURRENTLY commits the dead state before its last
+-- wait, so a failure after that leaves the dead row behind.  Clearing
+-- indisnodata is what keeps pg_dump from restoring the index the user asked to
+-- drop.  The plain index is the control: it is left INVALID, and this one must
+-- not be reported any differently.
+SELECT injection_points_attach('drop-index-concurrently-after-set-dead', 'error');
+ injection_points_attach 
+-------------------------
+ 
+(1 row)
+
+CREATE TABLE drop_nodata_tbl (i int);
+INSERT INTO drop_nodata_tbl SELECT generate_series(1, 10);
+CREATE INDEX drop_nodata_ind ON drop_nodata_tbl (i) WITH NO DATA;
+CREATE INDEX drop_plain_ind ON drop_nodata_tbl (i);
+DROP INDEX CONCURRENTLY drop_nodata_ind;
+ERROR:  error triggered for injection point drop-index-concurrently-after-set-dead
+DROP INDEX CONCURRENTLY drop_plain_ind;
+ERROR:  error triggered for injection point drop-index-concurrently-after-set-dead
+SELECT c.relname, i.indisready, i.indisvalid, i.indislive, i.indisnodata
+  FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid
+  WHERE c.relname LIKE 'drop_%_ind'
+  ORDER BY c.relname;
+     relname     | indisready | indisvalid | indislive | indisnodata 
+-----------------+------------+------------+-----------+-------------
+ drop_nodata_ind | f          | f          | f         | f
+ drop_plain_ind  | f          | f          | f         | f
+(2 rows)
+
+SELECT injection_points_detach('drop-index-concurrently-after-set-dead');
+ injection_points_detach 
+-------------------------
+ 
+(1 row)
+
+DROP TABLE drop_nodata_tbl;
 DROP EXTENSION injection_points;

@@ -73,6 +73,7 @@
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
+#include "utils/injection_point.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -1701,6 +1702,18 @@ index_concurrently_swap(Oid newIndexId, Oid oldIndexId, const char *oldName)
 	oldIndexForm->indisclustered = false;
 	oldIndexForm->indisreplident = false;
 
+	/*
+	 * The old index keeps the storage the new one replaced, which for an
+	 * index created WITH NO DATA was never built.  Clear the flag anyway:
+	 * what is left here is transient debris awaiting the drop two phases from
+	 * now, and if the command does not reach that drop it must not be
+	 * mistaken for an index the user deferred and still intends to populate.
+	 * pg_dump would carry it into the new database as a definition, psql
+	 * would render it as having no data rather than as invalid, and a query
+	 * looking for indexes awaiting a build would list it.
+	 */
+	oldIndexForm->indisnodata = false;
+
 	CatalogTupleUpdate(pg_index, &oldIndexTuple->t_self, oldIndexTuple);
 	CatalogTupleUpdate(pg_index, &newIndexTuple->t_self, newIndexTuple);
 
@@ -2350,6 +2363,12 @@ index_drop(Oid indexId, bool concurrent, bool concurrent_lock_mode)
 		 */
 		CommitTransactionCommand();
 		StartTransactionCommand();
+
+		/*
+		 * The dead pg_index row is committed but the index is still there, so
+		 * this is the point at which a failure leaves one behind.
+		 */
+		INJECTION_POINT("drop-index-concurrently-after-set-dead", NULL);
 
 		/*
 		 * Wait till every transaction that saw the old index state has
@@ -3623,6 +3642,17 @@ index_set_state_flags(Oid indexId, IndexStateFlagsAction action)
 			Assert(!indexForm->indisready);
 			Assert(!indexForm->indisvalid);
 			indexForm->indisready = true;
+
+			/*
+			 * An index that is being made ready has data, so it is no longer
+			 * a no-data index.  This is not reachable today -- the concurrent
+			 * completion path builds a fresh copy and swaps it in, so the row
+			 * carrying indisnodata is dropped rather than updated -- but the
+			 * flag must never be observably true on an index with data, and
+			 * this is the concurrent counterpart of the clearing that
+			 * reindex_index() does.
+			 */
+			indexForm->indisnodata = false;
 			break;
 		case INDEX_CREATE_SET_VALID:
 			/* Set indisvalid during a CREATE INDEX CONCURRENTLY sequence */
@@ -3658,12 +3688,18 @@ index_set_state_flags(Oid indexId, IndexStateFlagsAction action)
 			 * We clear both indisready and indislive, because we not only
 			 * want to stop updates, we want to prevent sessions from touching
 			 * the index at all.
+			 *
+			 * indisnodata goes with them.  From here the row is wreckage left
+			 * behind by an interrupted drop, not a definition awaiting a
+			 * build, and anything reporting the no-data state would otherwise
+			 * present it as one.
 			 */
 			Assert(!indexForm->indisvalid);
 			Assert(!indexForm->indisclustered);
 			Assert(!indexForm->indisreplident);
 			indexForm->indisready = false;
 			indexForm->indislive = false;
+			indexForm->indisnodata = false;
 			break;
 	}
 
@@ -3971,6 +4007,10 @@ reindex_index(const ReindexStmt *stmt, Oid indexId,
 			indexForm->indisvalid = true;
 			indexForm->indisready = true;
 			indexForm->indislive = true;
+
+			/* An index we have just built is by definition not no-data. */
+			indexForm->indisnodata = false;
+
 			CatalogTupleUpdate(pg_index, &indexTuple->t_self, indexTuple);
 
 			/*
