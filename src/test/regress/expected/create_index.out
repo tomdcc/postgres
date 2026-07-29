@@ -3735,6 +3735,21 @@ SELECT c.relname, c.relkind, i.indisnodata, i.indisvalid,
  nodata_part_idx      | I       | f           | f          |    0
 (4 rows)
 
+-- naming the partitioned index populates every partition's index
+REINDEX INDEX nodata_part_idx;
+SELECT c.relname, c.relkind, i.indisnodata, i.indisvalid
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid IN ('nodata_part'::regclass, 'nodata_part_1'::regclass,
+                       'nodata_part_11'::regclass, 'nodata_part_2'::regclass)
+  ORDER BY 1;
+       relname        | relkind | indisnodata | indisvalid 
+----------------------+---------+-------------+------------
+ nodata_part_11_a_idx | i       | f           | t
+ nodata_part_1_a_idx  | I       | f           | f
+ nodata_part_2_a_idx  | i       | f           | t
+ nodata_part_idx      | I       | f           | f
+(4 rows)
+
 DROP TABLE nodata_part;
 -- rejected on system catalogs, whose scans do not consult indisvalid
 SET allow_system_table_mods = on;
@@ -3907,9 +3922,6 @@ HINT:  Populate "nodata_part1_idx" with REINDEX INDEX before attaching the parti
 -- populating it resolves the matter
 REINDEX INDEX nodata_part1_idx;
 ALTER TABLE nodata_parted ATTACH PARTITION nodata_part1 FOR VALUES FROM (100) TO (200);
-ERROR:  cannot attach index "nodata_part1_idx", which has no data, to index "nodata_parted_idx"
-DETAIL:  Index "nodata_parted_idx" is valid, and attaching an index with no data to it would make it invalid.
-HINT:  Populate "nodata_part1_idx" with REINDEX INDEX before attaching the partition, or drop it to have a new index built.
 SELECT c.relname, i.indisnodata, i.indisvalid, c.relispartition
   FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
   WHERE i.indrelid IN ('nodata_parted'::regclass, 'nodata_part0'::regclass,
@@ -3917,7 +3929,7 @@ SELECT c.relname, i.indisnodata, i.indisvalid, c.relispartition
       relname       | indisnodata | indisvalid | relispartition 
 --------------------+-------------+------------+----------------
  nodata_part0_a_idx | f           | t          | t
- nodata_part1_idx   | t           | t          | f
+ nodata_part1_idx   | f           | t          | t
  nodata_parted_idx  | f           | t          | f
 (3 rows)
 
@@ -3928,13 +3940,8 @@ CREATE TABLE nodata_parted (a int, b int) PARTITION BY RANGE (a);
 CREATE TABLE nodata_part0 PARTITION OF nodata_parted FOR VALUES FROM (0) TO (100);
 CREATE INDEX nodata_parted_idx ON nodata_parted (a);
 CREATE TABLE nodata_part1 (a int, b int);
-ERROR:  relation "nodata_part1" already exists
 CREATE INDEX nodata_part1_other ON nodata_part1 (b) WITH NO DATA;
-ERROR:  column "b" does not exist
-LINE 1: CREATE INDEX nodata_part1_other ON nodata_part1 (b) WITH NO ...
-                                                         ^
 ALTER TABLE nodata_parted ATTACH PARTITION nodata_part1 FOR VALUES FROM (100) TO (200);
-ERROR:  child table is missing column "b"
 SELECT c.relname, i.indisnodata, i.indisvalid, c.relispartition
   FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
   WHERE i.indrelid IN ('nodata_parted'::regclass, 'nodata_part0'::regclass,
@@ -3942,9 +3949,10 @@ SELECT c.relname, i.indisnodata, i.indisvalid, c.relispartition
       relname       | indisnodata | indisvalid | relispartition 
 --------------------+-------------+------------+----------------
  nodata_part0_a_idx | f           | t          | t
- nodata_part1_idx   | t           | t          | f
+ nodata_part1_a_idx | f           | t          | t
+ nodata_part1_other | t           | f          | f
  nodata_parted_idx  | f           | t          | f
-(3 rows)
+(4 rows)
 
 DROP TABLE nodata_parted;
 -- ALTER INDEX ... ATTACH PARTITION does allow it, leaving the parent invalid
@@ -3963,3 +3971,220 @@ SELECT c.relname, i.indisnodata, i.indisvalid
 (2 rows)
 
 DROP TABLE nodata_parted2;
+-- A REINDEX naming the index is how a no-data index is meant to be populated.
+CREATE TABLE nodata_done (a int, b text);
+INSERT INTO nodata_done SELECT g, g::text FROM generate_series(1, 1000) g;
+CREATE INDEX nodata_done_plain ON nodata_done (a) WITH NO DATA;
+CREATE INDEX nodata_done_conc ON nodata_done (b) WITH NO DATA;
+REINDEX INDEX nodata_done_plain;
+REINDEX INDEX CONCURRENTLY nodata_done_conc;
+SELECT indexrelid::regclass, indisnodata, indisvalid, indisready
+  FROM pg_index WHERE indrelid = 'nodata_done'::regclass ORDER BY 1;
+    indexrelid     | indisnodata | indisvalid | indisready 
+-------------------+-------------+------------+------------
+ nodata_done_plain | f           | t          | t
+ nodata_done_conc  | f           | t          | t
+(2 rows)
+
+-- the definition stops reporting the state along with the catalog flag
+SELECT pg_get_indexdef('nodata_done_plain'::regclass);
+                           pg_get_indexdef                            
+----------------------------------------------------------------------
+ CREATE INDEX nodata_done_plain ON public.nodata_done USING btree (a)
+(1 row)
+
+-- and the planner now uses it
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT * FROM nodata_done WHERE a = 42;
+                  QUERY PLAN                  
+----------------------------------------------
+ Bitmap Heap Scan on nodata_done
+   Recheck Cond: (a = 42)
+   ->  Bitmap Index Scan on nodata_done_plain
+         Index Cond: (a = 42)
+(4 rows)
+
+RESET enable_seqscan;
+-- The governing principle: once populated, an index created WITH NO DATA must
+-- be indistinguishable in pg_index from one created normally.  Compare every
+-- column except the two OIDs, which necessarily differ.
+CREATE TABLE nodata_same1 (a int, b text);
+CREATE TABLE nodata_same2 (a int, b text);
+CREATE UNIQUE INDEX nodata_same1_idx ON nodata_same1 (a) INCLUDE (b);
+CREATE UNIQUE INDEX nodata_same2_idx ON nodata_same2 (a) INCLUDE (b) WITH NO DATA;
+REINDEX INDEX nodata_same2_idx;
+SELECT (SELECT ROW(indnatts, indnkeyatts, indisunique, indnullsnotdistinct,
+                   indisprimary, indisexclusion, indimmediate, indisclustered,
+                   indisvalid, indcheckxmin, indisready, indislive,
+                   indisreplident, indisnodata, indkey::text,
+                   indcollation::text, indclass::text, indoption::text,
+                   indexprs::text, indpred::text)
+          FROM pg_index WHERE indexrelid = 'nodata_same1_idx'::regclass)
+     = (SELECT ROW(indnatts, indnkeyatts, indisunique, indnullsnotdistinct,
+                   indisprimary, indisexclusion, indimmediate, indisclustered,
+                   indisvalid, indcheckxmin, indisready, indislive,
+                   indisreplident, indisnodata, indkey::text,
+                   indcollation::text, indclass::text, indoption::text,
+                   indexprs::text, indpred::text)
+          FROM pg_index WHERE indexrelid = 'nodata_same2_idx'::regclass)
+    AS pg_index_rows_identical;
+ pg_index_rows_identical 
+-------------------------
+ t
+(1 row)
+
+DROP TABLE nodata_same1, nodata_same2;
+-- A duplicate admitted during the gap makes the completing REINDEX fail
+-- loudly; the index stays no data, so the failure is retryable and nothing is
+-- silently corrupted.
+CREATE TABLE nodata_dup (a int);
+INSERT INTO nodata_dup VALUES (1), (1);
+CREATE UNIQUE INDEX nodata_dup_idx ON nodata_dup (a) WITH NO DATA;
+REINDEX INDEX nodata_dup_idx;
+ERROR:  could not create unique index "nodata_dup_idx"
+DETAIL:  Key (a)=(1) is duplicated.
+SELECT indisnodata, indisvalid, indisready FROM pg_index
+  WHERE indexrelid = 'nodata_dup_idx'::regclass;
+ indisnodata | indisvalid | indisready 
+-------------+------------+------------
+ t           | f          | f
+(1 row)
+
+DELETE FROM nodata_dup WHERE ctid = (SELECT max(ctid) FROM nodata_dup);
+REINDEX INDEX nodata_dup_idx;
+SELECT indisnodata, indisvalid, indisready FROM pg_index
+  WHERE indexrelid = 'nodata_dup_idx'::regclass;
+ indisnodata | indisvalid | indisready 
+-------------+------------+------------
+ f           | t          | t
+(1 row)
+
+DROP TABLE nodata_dup;
+-- REINDEX INDEX on a partitioned index fans out to the leaves and populates
+-- them.  This guards the placement of the reindex_relation() skip: naming a
+-- partitioned index names its leaves.
+CREATE TABLE nodata_fan (a int) PARTITION BY RANGE (a);
+CREATE TABLE nodata_fan1 PARTITION OF nodata_fan FOR VALUES FROM (0) TO (100);
+INSERT INTO nodata_fan SELECT generate_series(0, 99);
+CREATE INDEX nodata_fan1_idx ON nodata_fan1 (a) WITH NO DATA;
+CREATE INDEX nodata_fan_idx ON ONLY nodata_fan (a);
+ALTER INDEX nodata_fan_idx ATTACH PARTITION nodata_fan1_idx;
+SELECT c.relname, i.indisnodata, i.indisvalid FROM pg_index i
+  JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE c.relname IN ('nodata_fan_idx', 'nodata_fan1_idx') ORDER BY 1;
+     relname     | indisnodata | indisvalid 
+-----------------+-------------+------------
+ nodata_fan1_idx | t           | f
+ nodata_fan_idx  | f           | f
+(2 rows)
+
+-- The leaf is populated, but the parent stays invalid: nothing re-counts valid
+-- children after a REINDEX.  Re-issuing ALTER INDEX ... ATTACH PARTITION on the
+-- already-attached child is the documented way to re-run that check.
+REINDEX INDEX nodata_fan_idx;
+SELECT c.relname, i.indisnodata, i.indisvalid FROM pg_index i
+  JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE c.relname IN ('nodata_fan_idx', 'nodata_fan1_idx') ORDER BY 1;
+     relname     | indisnodata | indisvalid 
+-----------------+-------------+------------
+ nodata_fan1_idx | f           | t
+ nodata_fan_idx  | f           | f
+(2 rows)
+
+ALTER INDEX nodata_fan_idx ATTACH PARTITION nodata_fan1_idx;
+SELECT c.relname, i.indisnodata, i.indisvalid FROM pg_index i
+  JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE c.relname IN ('nodata_fan_idx', 'nodata_fan1_idx') ORDER BY 1;
+     relname     | indisnodata | indisvalid 
+-----------------+-------------+------------
+ nodata_fan1_idx | f           | t
+ nodata_fan_idx  | f           | t
+(2 rows)
+
+DROP TABLE nodata_fan;
+-- Populating the leaf index before attaching it avoids that second step
+-- entirely, since the attach itself performs the validation.
+CREATE TABLE nodata_fan2 (a int) PARTITION BY RANGE (a);
+CREATE TABLE nodata_fan2a PARTITION OF nodata_fan2 FOR VALUES FROM (0) TO (100);
+INSERT INTO nodata_fan2 SELECT generate_series(0, 99);
+CREATE INDEX nodata_fan2a_idx ON nodata_fan2a (a) WITH NO DATA;
+CREATE INDEX nodata_fan2_idx ON ONLY nodata_fan2 (a);
+REINDEX INDEX nodata_fan2a_idx;
+ALTER INDEX nodata_fan2_idx ATTACH PARTITION nodata_fan2a_idx;
+SELECT c.relname, i.indisnodata, i.indisvalid FROM pg_index i
+  JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE c.relname IN ('nodata_fan2_idx', 'nodata_fan2a_idx') ORDER BY 1;
+     relname      | indisnodata | indisvalid 
+------------------+-------------+------------
+ nodata_fan2_idx  | f           | t
+ nodata_fan2a_idx | f           | t
+(2 rows)
+
+DROP TABLE nodata_fan2;
+-- Completion is reachable by a MAINTAIN role that owns nothing: REINDEX is
+-- covered by MAINTAIN, while CREATE INDEX and DROP INDEX are not.  This
+-- privilege split is one of the two reasons the feature exists.
+CREATE ROLE regress_nodata_maint;
+CREATE TABLE nodata_priv (a int);
+INSERT INTO nodata_priv SELECT generate_series(1, 100);
+CREATE INDEX nodata_priv_idx ON nodata_priv (a) WITH NO DATA;
+GRANT MAINTAIN ON nodata_priv TO regress_nodata_maint;
+SET SESSION AUTHORIZATION regress_nodata_maint;
+CREATE INDEX nodata_priv_idx2 ON nodata_priv (a) WITH NO DATA;  -- fails
+ERROR:  must be owner of table nodata_priv
+DROP INDEX nodata_priv_idx;                                      -- fails
+ERROR:  must be owner of index nodata_priv_idx
+REINDEX INDEX nodata_priv_idx;                                   -- succeeds
+RESET SESSION AUTHORIZATION;
+SELECT indisnodata, indisvalid, indisready FROM pg_index
+  WHERE indexrelid = 'nodata_priv_idx'::regclass;
+ indisnodata | indisvalid | indisready 
+-------------+------------+------------
+ f           | t          | t
+(1 row)
+
+DROP TABLE nodata_priv;
+DROP ROLE regress_nodata_maint;
+-- A no-data index can be made the replica identity: the setting is recorded
+-- and takes effect once the index is populated, since RelationGetIndexList()
+-- will not use an index that is not yet valid.
+CREATE TABLE nodata_ri (a int NOT NULL);
+INSERT INTO nodata_ri SELECT generate_series(1, 100);
+CREATE UNIQUE INDEX nodata_ri_idx ON nodata_ri (a) WITH NO DATA;
+ALTER TABLE nodata_ri REPLICA IDENTITY USING INDEX nodata_ri_idx;
+SELECT relreplident FROM pg_class WHERE oid = 'nodata_ri'::regclass;
+ relreplident 
+--------------
+ i
+(1 row)
+
+SELECT pg_get_replica_identity_index('nodata_ri'::regclass) AS in_use;
+ in_use 
+--------
+ 
+(1 row)
+
+\d nodata_ri
+             Table "public.nodata_ri"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ a      | integer |           | not null | 
+Indexes:
+    "nodata_ri_idx" UNIQUE, btree (a) WITH NO DATA INVALID REPLICA IDENTITY
+
+REINDEX INDEX nodata_ri_idx;
+SELECT pg_get_replica_identity_index('nodata_ri'::regclass) AS in_use;
+    in_use     
+---------------
+ nodata_ri_idx
+(1 row)
+
+\d nodata_ri
+             Table "public.nodata_ri"
+ Column |  Type   | Collation | Nullable | Default 
+--------+---------+-----------+----------+---------
+ a      | integer |           | not null | 
+Indexes:
+    "nodata_ri_idx" UNIQUE, btree (a) REPLICA IDENTITY
+
+DROP TABLE nodata_ri;
