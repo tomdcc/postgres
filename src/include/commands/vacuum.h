@@ -374,7 +374,8 @@ extern void vacuum(List *relations, const VacuumParams *params,
 				   BufferAccessStrategy bstrategy, MemoryContext vac_context,
 				   bool isTopLevel);
 extern void vac_open_indexes(Relation relation, LOCKMODE lockmode,
-							 int *nindexes, Relation **Irel);
+							 int *nindexes, Relation **Irel,
+							 bool *hasindex);
 extern void vac_close_indexes(int nindexes, Relation *Irel, LOCKMODE lockmode);
 extern double vac_estimate_reltuples(Relation relation,
 									 BlockNumber total_pages,

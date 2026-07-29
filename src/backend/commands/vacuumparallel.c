@@ -1245,7 +1245,7 @@ parallel_vacuum_main(dsm_segment *seg, shm_toc *toc)
 	 * Open all indexes. indrels are sorted in order by OID, which should be
 	 * matched to the leader's one.
 	 */
-	vac_open_indexes(rel, RowExclusiveLock, &nindexes, &indrels);
+	vac_open_indexes(rel, RowExclusiveLock, &nindexes, &indrels, NULL);
 	Assert(nindexes > 0);
 
 	/*
