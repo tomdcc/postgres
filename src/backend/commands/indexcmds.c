@@ -3923,7 +3923,7 @@ static void
 ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *params, bool isTopLevel)
 {
 	List	   *partitions = NIL;
-	List	   *partedidxs = NIL;
+	List	   *partedrels = NIL;
 	char		relkind = get_rel_relkind(relid);
 	char	   *relname = get_rel_name(relid);
 	char	   *relnamespace = get_namespace_name(get_rel_namespace(relid));
@@ -3984,10 +3984,11 @@ ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *param
 		 */
 		if (!RELKIND_HAS_STORAGE(partkind))
 		{
-			if (partkind == RELKIND_PARTITIONED_INDEX)
+			if (partkind == RELKIND_PARTITIONED_INDEX ||
+				partkind == RELKIND_PARTITIONED_TABLE)
 			{
 				old_context = MemoryContextSwitchTo(reindex_context);
-				partedidxs = lappend_oid(partedidxs, partoid);
+				partedrels = lappend_oid(partedrels, partoid);
 				MemoryContextSwitchTo(old_context);
 			}
 			continue;
@@ -4012,29 +4013,31 @@ ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *param
 	 * A partitioned index is valid only while every partition has a valid
 	 * index attached, and nothing recomputes that when a child index becomes
 	 * valid again.  Having just rebuilt every child, this is exactly the
-	 * moment the tree may have become validatable, so check now; otherwise a
-	 * user who reindexed a partitioned index to repair an invalid child would
-	 * be left with a parent that is still invalid, and no obvious way to fix
-	 * it.
+	 * moment such an index may have become validatable, so check now;
+	 * otherwise a user who reindexed to repair an invalid child would be left
+	 * with an index that is still invalid, and no obvious way to fix it.
 	 *
-	 * This is only done for REINDEX INDEX.  REINDEX TABLE on a partitioned
-	 * table also rebuilds every child index, but revalidating indexes the
-	 * user did not name is a larger behavioral change, and is left alone.
+	 * Only ever work downwards: recheck the index named, or the indexes of
+	 * the table named, and everything beneath, but never an index above.
+	 * Besides being the less surprising rule, this keeps REINDEX from locking
+	 * upwards from a relation it has already locked, which would invert the
+	 * order the ATTACH PARTITION path uses.  A tree with more than one
+	 * invalid level is repaired from the bottom upwards.
 	 *
-	 * Work from the deepest index upwards: validatePartitionedIndex()
-	 * recurses to a validated index's own parent, but never downwards, so an
-	 * intermediate partitioned index has to be validated before its parent
-	 * can be.  find_all_inheritors() returns breadth-first, so iterating in
-	 * reverse visits the deepest first.
+	 * Deepest first, because validatePartitionedIndex() recurses to a
+	 * validated index's own parent but never downwards, so an intermediate
+	 * partitioned index has to be validated before its parent can be.
+	 * find_all_inheritors() returns breadth-first, so iterating in reverse
+	 * visits the deepest first.
 	 *
-	 * validatePartitionedIndex() is careful about the incomplete cases: it
-	 * counts valid children and marks the parent valid only if the count
-	 * reaches the number of partitions, so a partition with no attached index
-	 * at all correctly leaves the parent invalid.  That is not reported here:
-	 * every leaf rebuild either succeeded or raised an error, so an index
-	 * that is still invalid is one whose tree was already incomplete before
-	 * this command, which REINDEX neither caused nor can repair.  REINDEX
-	 * (VALIDITY_ONLY) is the way to ask about validity and be told.
+	 * validatePartitionedIndex() handles the incomplete cases: it counts
+	 * valid attached children and marks the index valid only if the count
+	 * reaches the number of partitions, so a partition with no index
+	 * attached, or one that exists but is not attached, correctly leaves it
+	 * invalid.  That is not reported: every leaf rebuild either succeeded or
+	 * raised an error, so an index still invalid afterwards is one whose tree
+	 * was already incomplete, which REINDEX neither caused nor can repair.
+	 * REINDEX (VALIDITY_ONLY) is the way to ask about validity and be told.
 	 *
 	 * Note ReindexMultipleInternal() committed our transaction and started a
 	 * new one, so the locks taken above are gone and must be retaken.  Lock
@@ -4042,18 +4045,51 @@ ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *param
 	 * deadlocking against it.  That new transaction has no active snapshot
 	 * either, and updating pg_index needs one.
 	 */
-	if (relkind == RELKIND_PARTITIONED_INDEX)
 	{
+		List	   *tovalidate = NIL;
+
 		PushActiveSnapshot(GetTransactionSnapshot());
 
-		for (int i = list_length(partedidxs) - 1; i >= 0; i--)
+		/*
+		 * Collect the partitioned indexes to recheck, deepest first.  When an
+		 * index was named these are the entries themselves; when a table was
+		 * named they are the partitioned indexes on each partitioned table in
+		 * the tree.
+		 */
+		for (int i = list_length(partedrels) - 1; i >= 0; i--)
 		{
-			Oid			idxoid = list_nth_oid(partedidxs, i);
+			Oid			oid = list_nth_oid(partedrels, i);
+
+			if (relkind == RELKIND_PARTITIONED_INDEX)
+				tovalidate = lappend_oid(tovalidate, oid);
+			else
+			{
+				Relation	partedTbl;
+				ListCell   *lc2;
+
+				/* the relation may have gone away since we listed it */
+				partedTbl = try_table_open(oid, ShareUpdateExclusiveLock);
+				if (partedTbl == NULL)
+					continue;
+
+				foreach(lc2, RelationGetIndexList(partedTbl))
+					tovalidate = lappend_oid(tovalidate, lfirst_oid(lc2));
+
+				table_close(partedTbl, NoLock);
+			}
+		}
+
+		foreach(lc, tovalidate)
+		{
+			Oid			idxoid = lfirst_oid(lc);
 			Relation	partedTbl;
 			Relation	partedIdx;
 			bool		validated;
 
-			/* Nothing to do if a deeper level already validated this one */
+			if (get_rel_relkind(idxoid) != RELKIND_PARTITIONED_INDEX)
+				continue;
+
+			/* nothing to do if a deeper level already validated this one */
 			if (get_index_isvalid(idxoid))
 				continue;
 
@@ -4073,11 +4109,12 @@ ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *param
 		}
 
 		/*
-		 * If the index named came out valid, its parent may still not be. The
-		 * loop above left the parent alone, as REINDEX always does, so point
-		 * it out.
+		 * If the user named an index and it came out valid, its parent may
+		 * still not be.  The loop above left the parent alone, as REINDEX
+		 * always does, so point it out.  Nothing to report when a table was
+		 * named: that names no one index whose parent to speak of.
 		 */
-		if (get_index_isvalid(relid))
+		if (relkind == RELKIND_PARTITIONED_INDEX && get_index_isvalid(relid))
 			ReindexReportInvalidParent(ReindexParentIndexOid(relid));
 
 		PopActiveSnapshot();

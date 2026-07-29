@@ -1242,6 +1242,45 @@ reindex index parted_reind9_idx;  -- errors, rebuilding needs its own transactio
 rollback;
 drop table parted_reind9_tab;
 
+-- REINDEX TABLE on a partitioned table rechecks the partitioned indexes on
+-- the table named and below it, on the same downward-only terms.
+create function parted_reind5_f(int) returns int
+  immutable language sql as 'select $1 / 0';
+create table parted_reind5_tab (a int) partition by range (a);
+create table parted_reind5_tab_1 partition of parted_reind5_tab
+  for values from (1) to (10) partition by range (a);
+create table parted_reind5_tab_11 partition of parted_reind5_tab_1
+  for values from (1) to (5);
+insert into parted_reind5_tab_11 values (1);
+create index concurrently parted_reind5_idx_11
+  on parted_reind5_tab_11 (parted_reind5_f(a));
+create index parted_reind5_idx_1
+  on only parted_reind5_tab_1 (parted_reind5_f(a));
+create index parted_reind5_idx
+  on only parted_reind5_tab (parted_reind5_f(a));
+alter index parted_reind5_idx_1 attach partition parted_reind5_idx_11;
+alter index parted_reind5_idx attach partition parted_reind5_idx_1;
+create or replace function parted_reind5_f(int) returns int
+  immutable language sql as 'select $1';
+select indexrelid::regclass, indisvalid
+  from pg_index
+  where indexrelid::regclass::text like 'parted_reind5%'
+  order by indexrelid::regclass::text collate "C";
+-- naming the intermediate table validates its index, not the one above it
+reindex table parted_reind5_tab_1;
+select indexrelid::regclass, indisvalid
+  from pg_index
+  where indexrelid::regclass::text like 'parted_reind5%'
+  order by indexrelid::regclass::text collate "C";
+-- naming the top validates the rest
+reindex table parted_reind5_tab;
+select indexrelid::regclass, indisvalid
+  from pg_index
+  where indexrelid::regclass::text like 'parted_reind5%'
+  order by indexrelid::regclass::text collate "C";
+drop table parted_reind5_tab;
+drop function parted_reind5_f(int);
+
 -- VALIDITY_ONLY is accepted for REINDEX INDEX only, and only on a
 -- partitioned index: an index with storage has no validity to recheck.
 create table parted_reind4_tab (a int) partition by range (a);
