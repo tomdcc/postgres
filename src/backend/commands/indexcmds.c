@@ -3298,6 +3298,7 @@ ReindexMultipleTables(const ReindexStmt *stmt, const ReindexParams *params)
 	MemoryContext private_context;
 	MemoryContext old;
 	List	   *relids = NIL;
+	List	   *partedidxs = NIL;
 	int			num_keys;
 	bool		concurrent_warning = false;
 	bool		tablespace_warning = false;
@@ -3389,12 +3390,49 @@ ReindexMultipleTables(const ReindexStmt *stmt, const ReindexParams *params)
 		Oid			relid = classtuple->oid;
 
 		/*
-		 * Only regular tables and matviews can have indexes, so ignore any
-		 * other kind of relation.
+		 * Only relations with storage are rebuilt here, which means regular
+		 * tables and matviews; partitioned tables and indexes are skipped,
+		 * but their leaf partitions are processed directly, so no index
+		 * rebuild is missed.  (The long-standing comment here said that only
+		 * regular tables and matviews can have indexes.  That predates
+		 * partitioning and is no longer true: a partitioned table has
+		 * indexes, they simply have no storage.)
 		 *
-		 * Partitioned tables/indexes are skipped but matching leaf partitions
-		 * are processed.
+		 * A partitioned index has nothing to rebuild, but its validity may
+		 * become restorable once the leaf indexes beneath it have been, so
+		 * collect it for the recheck after the rebuilds; see below.  Apply
+		 * the same user/system classification as for the relations rebuilt,
+		 * so that the recheck covers exactly the same scope.
 		 */
+		if (classtuple->relkind == RELKIND_PARTITIONED_INDEX)
+		{
+			/*
+			 * Skip another backend's temporary relations, as the rebuild loop
+			 * below does.  The recheck locks each index it collects, and a
+			 * lock on a temporary relation of a live session is not one this
+			 * command can expect to get: it would wait for that session to
+			 * end its transaction, turning REINDEX DATABASE into a command
+			 * that blocks behind unrelated backends.  Nothing is lost by
+			 * skipping it, since the partitions beneath it are skipped too
+			 * and their indexes are therefore never rebuilt here.
+			 */
+			if (classtuple->relpersistence == RELPERSISTENCE_TEMP &&
+				!isTempNamespace(classtuple->relnamespace))
+				continue;
+
+			if (objectKind == REINDEX_OBJECT_SYSTEM &&
+				!IsCatalogRelationOid(relid))
+				continue;
+			else if (objectKind == REINDEX_OBJECT_DATABASE &&
+					 IsCatalogRelationOid(relid))
+				continue;
+
+			old = MemoryContextSwitchTo(private_context);
+			partedidxs = lappend_oid(partedidxs, relid);
+			MemoryContextSwitchTo(old);
+			continue;
+		}
+
 		if (classtuple->relkind != RELKIND_RELATION &&
 			classtuple->relkind != RELKIND_MATVIEW)
 			continue;
@@ -3498,6 +3536,97 @@ ReindexMultipleTables(const ReindexStmt *stmt, const ReindexParams *params)
 	 * commits and then starts a new transaction immediately.
 	 */
 	ReindexMultipleInternal(stmt, relids, params);
+
+	/*
+	 * Every index with storage in this schema or database has now been
+	 * rebuilt, so any partitioned index above them may have become valid
+	 * again.  Nothing else recomputes that, so a tree left invalid by an
+	 * earlier failure would otherwise stay invalid however many times its
+	 * indexes were rebuilt.
+	 *
+	 * The scope of the recheck is the scope that was named: the partitioned
+	 * indexes collected above, and no others.  For REINDEX DATABASE that is
+	 * every one of them; for REINDEX SCHEMA it stops at the schema boundary,
+	 * which is a real limit rather than a theoretical one, because a
+	 * partitioned table's partitions may live in a different schema from the
+	 * table itself.  An index outside the scope is left alone even when it
+	 * would now validate, in keeping with REINDEX not modifying what it was
+	 * not given.
+	 *
+	 * This is expressed as a recheck of each collected index rather than as a
+	 * walk up from the leaves, which comes to the same thing: an ancestor
+	 * inside the scope is itself in the list, and one outside it is not.
+	 * Doing it this way also means never ascending, so
+	 * validatePartitionedIndex() is called with validate_parent false; its
+	 * own recursion asserts that the parent is invalid, which need not hold
+	 * here, since several independent subtrees in a schema can share an
+	 * ancestor and the first of them to be validated will have made that
+	 * ancestor valid already.
+	 *
+	 * Repeat until a pass changes nothing.  An index cannot be validated
+	 * before those beneath it are, and each pass validates at least the
+	 * deepest level still outstanding, so this converges in as many passes as
+	 * the tree is deep, which in practice is one or two.  Indexes already
+	 * valid are skipped, so a settled tree costs one syscache lookup each.
+	 *
+	 * Note ReindexMultipleInternal() committed our transaction and started a
+	 * new one, so any locks are gone and are retaken here, table before index
+	 * as ReindexPartitions() does; see the note there on ATTACH PARTITION
+	 * taking them in the other order.  That new transaction has no active
+	 * snapshot either, and updating pg_index needs one.
+	 */
+	if (partedidxs != NIL)
+	{
+		bool		progress = true;
+
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		while (progress)
+		{
+			ListCell   *lc;
+
+			progress = false;
+
+			foreach(lc, partedidxs)
+			{
+				Oid			idxoid = lfirst_oid(lc);
+				Relation	partedTbl;
+				Relation	partedIdx;
+				Oid			tbloid;
+
+				/* skip those already valid, including from an earlier pass */
+				if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(idxoid)))
+					continue;
+				if (get_index_isvalid(idxoid))
+					continue;
+
+				tbloid = IndexGetRelation(idxoid, true);
+				if (!OidIsValid(tbloid))
+					continue;
+
+				partedTbl = try_table_open(tbloid, ShareUpdateExclusiveLock);
+				if (partedTbl == NULL)
+					continue;
+				partedIdx = try_index_open(idxoid, ShareUpdateExclusiveLock);
+				if (partedIdx == NULL)
+				{
+					table_close(partedTbl, NoLock);
+					continue;
+				}
+
+				if (validatePartitionedIndex(partedIdx, partedTbl, false))
+					progress = true;
+
+				index_close(partedIdx, NoLock);
+				table_close(partedTbl, NoLock);
+
+				/* make the update visible to the rest of the pass */
+				CommandCounterIncrement();
+			}
+		}
+
+		PopActiveSnapshot();
+	}
 
 	MemoryContextDelete(private_context);
 }
