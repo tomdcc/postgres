@@ -17,6 +17,7 @@ REGRESS_OPTS = --dlpath=$(top_builddir)/src/test/regress
 ISOLATION = basic \
 	    inplace \
 	    reindex_concurrently_deferred \
+	    reindex_concurrently_nodata \
 	    repack \
 	    repack_commit_race \
 	    repack_decode \
