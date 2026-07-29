@@ -2412,10 +2412,16 @@ vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
  * vacuum even if the index isn't indisvalid; this is important because in a
  * unique index, uniqueness checks will be performed anyway and had better not
  * hit dangling index pointers.
+ *
+ * If hasindex isn't NULL, it receives whether the relation has any indexes at
+ * all, which is not the same question: an index that is not vacuumable is
+ * still an index.  Callers maintaining pg_class.relhasindex want this rather
+ * than *nindexes, since clearing that flag while an index exists would be
+ * incorrect.
  */
 void
 vac_open_indexes(Relation relation, LOCKMODE lockmode,
-				 int *nindexes, Relation **Irel)
+				 int *nindexes, Relation **Irel, bool *hasindex)
 {
 	List	   *indexoidlist;
 	ListCell   *indexoidscan;
@@ -2424,6 +2430,9 @@ vac_open_indexes(Relation relation, LOCKMODE lockmode,
 	Assert(lockmode != NoLock);
 
 	indexoidlist = RelationGetIndexList(relation);
+
+	if (hasindex != NULL)
+		*hasindex = (indexoidlist != NIL);
 
 	/* allocate enough memory for all indexes */
 	i = list_length(indexoidlist);

@@ -305,6 +305,46 @@ SELECT relname, relhasindex FROM pg_class
 (3 rows)
 
 DROP TABLE vacparted_i;
+-- relhasindex must not be cleared while an index exists, even when none of
+-- the indexes can be vacuumed.  A CREATE INDEX CONCURRENTLY that fails early
+-- leaves an index that is not indisready, which VACUUM skips; the flag still
+-- has to reflect that the index is there.
+CREATE TABLE vac_hasindex (a int);
+INSERT INTO vac_hasindex VALUES (1), (1);
+CREATE UNIQUE INDEX CONCURRENTLY vac_hasindex_idx ON vac_hasindex (a);
+ERROR:  could not create unique index "vac_hasindex_idx"
+DETAIL:  Key (a)=(1) is duplicated.
+SELECT indisready FROM pg_index
+  WHERE indexrelid = 'vac_hasindex_idx'::regclass;
+ indisready 
+------------
+ f
+(1 row)
+
+VACUUM vac_hasindex;
+SELECT relhasindex FROM pg_class WHERE oid = 'vac_hasindex'::regclass;
+ relhasindex 
+-------------
+ t
+(1 row)
+
+ANALYZE vac_hasindex;
+SELECT relhasindex FROM pg_class WHERE oid = 'vac_hasindex'::regclass;
+ relhasindex 
+-------------
+ t
+(1 row)
+
+-- but it is still cleared once the index really is gone
+DROP INDEX vac_hasindex_idx;
+VACUUM vac_hasindex;
+SELECT relhasindex FROM pg_class WHERE oid = 'vac_hasindex'::regclass;
+ relhasindex 
+-------------
+ f
+(1 row)
+
+DROP TABLE vac_hasindex;
 -- multiple tables specified
 VACUUM vaccluster, vactst;
 VACUUM vacparted, does_not_exist;
