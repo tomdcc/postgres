@@ -1,0 +1,322 @@
+--
+-- Test foreign keys with WHERE clauses
+--
+--
+-- Basic setup
+--
+create type commentable_entity as enum ('blog', 'event');
+create table blog (
+	id int4 primary key
+);
+create table event (
+	id int4 primary key
+);
+create table comment (
+	id int4,
+	parent_entity commentable_entity not null,
+	parent_id int4 default 66
+);
+--
+-- basic fk insertion / pk deletion / pk update with restrict
+--
+-- add constraints
+alter table comment add constraint comment_blog_fk foreign key (parent_id)
+	where (parent_entity = 'blog')
+	references blog(id)
+	on delete restrict;
+alter table comment add constraint comment_event_fk foreign key (parent_id)
+	where (parent_entity = 'event')
+	references event(id)
+	on update restrict;
+-- data setup
+insert into blog values (10);
+insert into event values (20);
+insert into comment values(1, 'blog', 10);
+insert into comment values(2, 'event', 20);
+-- failing insert
+insert into comment values(3, 'blog', 20); -- fails
+ERROR:  insert or update on table "comment" violates foreign key constraint "comment_blog_fk"
+DETAIL:  Key (parent_id)=(20) is not present in table "blog".
+select * from comment order by id;
+ id | parent_entity | parent_id 
+----+---------------+-----------
+  1 | blog          |        10
+  2 | event         |        20
+(2 rows)
+
+-- delete of foreign key
+delete from blog; -- fails
+ERROR:  update or delete on table "blog" violates foreign key constraint "comment_blog_fk" on table "comment"
+DETAIL:  Key (id)=(10) is still referenced from table "comment".
+select * from comment order by id;
+ id | parent_entity | parent_id 
+----+---------------+-----------
+  1 | blog          |        10
+  2 | event         |        20
+(2 rows)
+
+-- update of foreign key
+update event set id = 77; -- fails
+ERROR:  update or delete on table "event" violates foreign key constraint "comment_event_fk" on table "comment"
+DETAIL:  Key (id)=(20) is still referenced from table "comment".
+select * from comment order by id;
+ id | parent_entity | parent_id 
+----+---------------+-----------
+  1 | blog          |        10
+  2 | event         |        20
+(2 rows)
+
+-- cleanup
+delete from comment;
+delete from blog;
+delete from event;
+alter table comment drop constraint comment_blog_fk;
+alter table comment drop constraint comment_event_fk;
+--
+-- cascade deletions / updates
+--
+-- add constraints
+alter table comment add constraint comment_blog_fk foreign key (parent_id)
+	where (parent_entity = 'blog')
+	references blog(id)
+	on delete cascade;
+alter table comment add constraint comment_event_fk foreign key (parent_id)
+	where (parent_entity = 'event')
+	references event(id)
+	on update cascade;
+-- data setup
+insert into blog values (10);
+insert into blog values (20);
+insert into comment values(1, 'blog', 10);
+insert into comment values(2, 'blog', 20);
+insert into event values (10);
+insert into event values (20);
+insert into comment values(3, 'event', 10);
+insert into comment values(4, 'event', 20);
+-- cascading update
+update event set id = 22 where id = 20;
+select * from comment order by id;
+ id | parent_entity | parent_id 
+----+---------------+-----------
+  1 | blog          |        10
+  2 | blog          |        20
+  3 | event         |        10
+  4 | event         |        22
+(4 rows)
+
+-- cascading delete
+delete from blog where id = 10;
+select * from comment order by id;
+ id | parent_entity | parent_id 
+----+---------------+-----------
+  2 | blog          |        20
+  3 | event         |        10
+  4 | event         |        22
+(3 rows)
+
+-- cleanup
+delete from comment;
+delete from event;
+delete from blog;
+alter table comment drop constraint comment_blog_fk;
+alter table comment drop constraint comment_event_fk;
+--
+-- set null
+--
+-- add constraints
+alter table comment add constraint comment_blog_fk foreign key (parent_id)
+	where (parent_entity = 'blog')
+	references blog(id)
+	on delete set null;
+alter table comment add constraint comment_event_fk foreign key (parent_id)
+	where (parent_entity = 'event')
+	references event(id)
+	on update set null;
+-- data setup
+insert into blog values (10);
+insert into blog values (20);
+insert into comment values(1, 'blog', 10);
+insert into comment values(2, 'blog', 20);
+insert into event values (10);
+insert into event values (20);
+insert into comment values(3, 'event', 10);
+insert into comment values(4, 'event', 20);
+-- update
+update event set id = 22 where id = 20;
+select * from comment order by id;
+ id | parent_entity | parent_id 
+----+---------------+-----------
+  1 | blog          |        10
+  2 | blog          |        20
+  3 | event         |        10
+  4 | event         |          
+(4 rows)
+
+-- delete
+delete from blog where id = 10;
+select * from comment order by id;
+ id | parent_entity | parent_id 
+----+---------------+-----------
+  1 | blog          |          
+  2 | blog          |        20
+  3 | event         |        10
+  4 | event         |          
+(4 rows)
+
+-- cleanup
+delete from comment;
+delete from event;
+delete from blog;
+alter table comment drop constraint comment_blog_fk;
+alter table comment drop constraint comment_event_fk;
+--
+-- set default
+--
+-- add constraints
+alter table comment add constraint comment_blog_fk foreign key (parent_id)
+	where (parent_entity = 'blog')
+	references blog(id)
+	on delete set default;
+alter table comment add constraint comment_event_fk foreign key (parent_id)
+	where (parent_entity = 'event')
+	references event(id)
+	on update set default;
+-- data setup
+insert into blog values (10);
+insert into blog values (20);
+insert into comment values(1, 'blog', 10);
+insert into comment values(2, 'blog', 20);
+insert into event values (10);
+insert into event values (20);
+insert into comment values(3, 'event', 10);
+insert into comment values(4, 'event', 20);
+-- update
+update event set id = 22 where id = 20; -- fails
+ERROR:  insert or update on table "comment" violates foreign key constraint "comment_event_fk"
+DETAIL:  Key (parent_id)=(66) is not present in table "event".
+insert into event values (66);
+update event set id = 22 where id = 20;
+select * from comment order by id;
+ id | parent_entity | parent_id 
+----+---------------+-----------
+  1 | blog          |        10
+  2 | blog          |        20
+  3 | event         |        10
+  4 | event         |        66
+(4 rows)
+
+-- delete
+delete from blog where id = 10; -- fails
+ERROR:  insert or update on table "comment" violates foreign key constraint "comment_blog_fk"
+DETAIL:  Key (parent_id)=(66) is not present in table "blog".
+insert into blog values (66);
+delete from blog where id = 10;
+select * from comment order by id;
+ id | parent_entity | parent_id 
+----+---------------+-----------
+  1 | blog          |        66
+  2 | blog          |        20
+  3 | event         |        10
+  4 | event         |        66
+(4 rows)
+
+-- cleanup
+delete from comment;
+delete from event;
+delete from blog;
+alter table comment drop constraint comment_blog_fk;
+alter table comment drop constraint comment_event_fk;
+--
+-- no action with deferred constraints
+--
+-- add constraints
+alter table comment add constraint comment_blog_fk foreign key (parent_id)
+	where (parent_entity = 'blog')
+	references blog(id)
+	on delete no action
+	deferrable initially deferred;
+alter table comment add constraint comment_event_fk foreign key (parent_id)
+	where (parent_entity = 'event')
+	references event(id)
+	on update no action
+	deferrable initially deferred;
+-- data setup
+insert into blog values (10);
+insert into blog values (20);
+insert into comment values(1, 'blog', 10);
+insert into comment values(2, 'blog', 20);
+insert into event values (10);
+insert into event values (20);
+insert into comment values(3, 'event', 10);
+insert into comment values(4, 'event', 20);
+-- update
+begin;
+update event set id = 22 where id = 20;
+insert into event values (20);
+commit;
+select * from comment order by id;
+ id | parent_entity | parent_id 
+----+---------------+-----------
+  1 | blog          |        10
+  2 | blog          |        20
+  3 | event         |        10
+  4 | event         |        20
+(4 rows)
+
+-- delete
+begin;
+delete from blog where id = 10;
+insert into blog values (10);
+commit;
+select * from comment order by id;
+ id | parent_entity | parent_id 
+----+---------------+-----------
+  1 | blog          |        10
+  2 | blog          |        20
+  3 | event         |        10
+  4 | event         |        20
+(4 rows)
+
+-- cleanup
+delete from comment;
+delete from event;
+delete from blog;
+alter table comment drop constraint comment_blog_fk;
+alter table comment drop constraint comment_event_fk;
+--
+-- error handling
+--
+-- non-existent column
+alter table comment add constraint comment_blog_fk foreign key (parent_id)
+	where (foo = 'blog')
+	references blog(id);
+ERROR:  column "foo" does not exist
+-- wrong type
+alter table comment add constraint comment_blog_fk foreign key (parent_id)
+	where (parent_entity = 1234)
+	references blog(id);
+ERROR:  operator does not exist: commentable_entity = integer
+HINT:  No operator matches the given name and argument type(s). You might need to add explicit type casts.
+-- expression not boolean
+alter table comment add constraint comment_blog_fk foreign key (parent_id)
+	where (parent_entity::text)
+	references blog(id);
+ERROR:  argument of WHERE must be type boolean, not type text
+--
+-- validation when table is pre-populated
+--
+insert into comment values(1, 'blog', 10);
+alter table comment add constraint comment_blog_fk foreign key (parent_id)
+	where (parent_entity = 'blog')
+	references blog(id); -- fails
+ERROR:  insert or update on table "comment" violates foreign key constraint "comment_blog_fk"
+DETAIL:  Key (parent_id)=(10) is not present in table "blog".
+insert into blog values(10);
+alter table comment add constraint comment_blog_fk foreign key (parent_id)
+	where (parent_entity = 'blog')
+	references blog(id);
+-- cleanup
+drop table comment;
+drop table blog;
+drop table event;
+drop type commentable_entity;
