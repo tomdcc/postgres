@@ -740,6 +740,15 @@ scanNSItemForColumn(ParseState *pstate, ParseNamespaceItem *nsitem,
 						colname),
 				 parser_errposition(pstate, location)));
 
+	/* Likewise in a foreign key's WHERE clause */
+	if (pstate->p_expr_kind == EXPR_KIND_FOREIGN_KEY_WHERE &&
+		attnum < InvalidAttrNumber && attnum != TableOidAttributeNumber)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
+				 errmsg("system column \"%s\" reference in foreign key WHERE condition is invalid",
+						colname),
+				 parser_errposition(pstate, location)));
+
 	/*
 	 * In generated column, no system column is allowed except tableOid.
 	 * (Required for stored generated, but we also do it for virtual generated

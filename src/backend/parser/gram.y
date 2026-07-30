@@ -4448,31 +4448,33 @@ ConstraintElem:
 								   NULL, NULL, yyscanner);
 					$$ = (Node *) n;
 				}
-			| FOREIGN KEY '(' columnList optionalPeriodName ')' REFERENCES qualified_name
+			| FOREIGN KEY '(' columnList optionalPeriodName ')' OptWhereClause
+				REFERENCES qualified_name
 				opt_column_and_period_list key_match key_actions ConstraintAttributeSpec
 				{
 					Constraint *n = makeNode(Constraint);
 
 					n->contype = CONSTR_FOREIGN;
 					n->location = @1;
-					n->pktable = $8;
+					n->pktable = $9;
 					n->fk_attrs = $4;
 					if ($5)
 					{
 						n->fk_attrs = lappend(n->fk_attrs, $5);
 						n->fk_with_period = true;
 					}
-					n->pk_attrs = linitial($9);
-					if (lsecond($9))
+					n->fk_where_clause = $7;
+					n->pk_attrs = linitial($10);
+					if (lsecond($10))
 					{
-						n->pk_attrs = lappend(n->pk_attrs, lsecond($9));
+						n->pk_attrs = lappend(n->pk_attrs, lsecond($10));
 						n->pk_with_period = true;
 					}
-					n->fk_matchtype = $10;
-					n->fk_upd_action = ($11)->updateAction->action;
-					n->fk_del_action = ($11)->deleteAction->action;
-					n->fk_del_set_cols = ($11)->deleteAction->cols;
-					processCASbits($12, @12, "FOREIGN KEY",
+					n->fk_matchtype = $11;
+					n->fk_upd_action = ($12)->updateAction->action;
+					n->fk_del_action = ($12)->deleteAction->action;
+					n->fk_del_set_cols = ($12)->deleteAction->cols;
+					processCASbits($13, @13, "FOREIGN KEY",
 								   &n->deferrable, &n->initdeferred,
 								   &n->is_enforced, &n->skip_validation, NULL,
 								   yyscanner);

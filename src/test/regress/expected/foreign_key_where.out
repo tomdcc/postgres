@@ -296,7 +296,8 @@ alter table comment add constraint comment_blog_fk foreign key (parent_id)
 	where (parent_entity = 1234)
 	references blog(id);
 ERROR:  operator does not exist: commentable_entity = integer
-HINT:  No operator matches the given name and argument type(s). You might need to add explicit type casts.
+DETAIL:  No operator of that name accepts the given argument types.
+HINT:  You might need to add explicit type casts.
 -- expression not boolean
 alter table comment add constraint comment_blog_fk foreign key (parent_id)
 	where (parent_entity::text)
@@ -315,6 +316,66 @@ insert into blog values(10);
 alter table comment add constraint comment_blog_fk foreign key (parent_id)
 	where (parent_entity = 'blog')
 	references blog(id);
+--
+-- the predicate round-trips through pg_get_constraintdef
+--
+select pg_get_constraintdef(oid) from pg_constraint
+	where conrelid = 'comment'::regclass order by conname;
+                                       pg_get_constraintdef                                       
+--------------------------------------------------------------------------------------------------
+ FOREIGN KEY (parent_id) WHERE ((parent_entity = 'blog'::commentable_entity)) REFERENCES blog(id)
+ NOT NULL parent_entity
+(2 rows)
+
+\d comment
+                       Table "public.comment"
+    Column     |        Type        | Collation | Nullable | Default 
+---------------+--------------------+-----------+----------+---------
+ id            | integer            |           |          | 
+ parent_entity | commentable_entity |           | not null | 
+ parent_id     | integer            |           |          | 66
+Foreign-key constraints:
+    "comment_blog_fk" FOREIGN KEY (parent_id) WHERE (parent_entity = 'blog'::commentable_entity) REFERENCES blog(id)
+
+-- feeding a deparsed definition back in reproduces it exactly
+alter table comment add constraint comment_blog_fk2
+	FOREIGN KEY (parent_id) WHERE ((parent_entity = 'blog'::commentable_entity))
+	REFERENCES blog(id);
+select pg_get_constraintdef(oid) from pg_constraint
+	where conrelid = 'comment'::regclass and conname = 'comment_blog_fk2';
+                                       pg_get_constraintdef                                       
+--------------------------------------------------------------------------------------------------
+ FOREIGN KEY (parent_id) WHERE ((parent_entity = 'blog'::commentable_entity)) REFERENCES blog(id)
+(1 row)
+
+alter table comment drop constraint comment_blog_fk2;
+-- the predicate's columns are depended on, not just the key columns
+alter table comment drop column parent_entity;
+ERROR:  cannot drop column parent_entity of table comment because other objects depend on it
+DETAIL:  constraint comment_blog_fk on table comment depends on column parent_entity of table comment
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+alter table comment drop constraint comment_blog_fk;
+--
+-- combinations that are not supported yet
+--
+create table part_comment (
+	id int4,
+	parent_entity commentable_entity not null,
+	parent_id int4
+) partition by range (id);
+alter table part_comment add constraint part_comment_blog_fk foreign key (parent_id)
+	where (parent_entity = 'blog')
+	references blog(id); -- fails
+ERROR:  foreign key with WHERE clause is not supported on partitioned table "part_comment"
+create table part_blog (
+	id int4 primary key
+) partition by range (id);
+alter table comment add constraint comment_partblog_fk foreign key (parent_id)
+	where (parent_entity = 'blog')
+	references part_blog(id); -- fails
+ERROR:  foreign key with WHERE clause cannot reference partitioned table "part_blog"
+drop table part_comment;
+drop table part_blog;
 -- cleanup
 drop table comment;
 drop table blog;

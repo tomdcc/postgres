@@ -113,9 +113,6 @@ static bool MergeWithExistingConstraint(Relation rel, const char *ccname, Node *
 										bool is_initially_valid,
 										bool is_no_inherit);
 static void SetRelationNumChecks(Relation rel, int numchecks);
-static Node *cookConstraint(ParseState *pstate,
-							Node *raw_constraint,
-							char *relname);
 
 
 /* ----------------------------------------------------------------
@@ -2257,6 +2254,7 @@ StoreRelCheck(Relation rel, const char *ccname, Node *expr,
 							  NULL, /* not an exclusion constraint */
 							  expr, /* Tree form of check constraint */
 							  ccbin,	/* Binary form of check constraint */
+							  NULL, /* no foreign key WHERE clause */
 							  is_local, /* conislocal */
 							  inhcount, /* coninhcount */
 							  is_no_inherit,	/* connoinherit */
@@ -2311,6 +2309,7 @@ StoreRelNotNull(Relation rel, const char *nnname, AttrNumber attnum,
 							  NULL, /* not an exclusion constraint */
 							  NULL,
 							  NULL,
+							  NULL, /* no foreign key WHERE clause */
 							  is_local,
 							  inhcount,
 							  is_no_inherit,
@@ -2526,7 +2525,8 @@ AddRelationNewConstraints(Relation rel,
 				 * verify it's valid as a CHECK constraint.
 				 */
 				expr = cookConstraint(pstate, cdef->raw_expr,
-									  RelationGetRelationName(rel));
+									  RelationGetRelationName(rel),
+									  true);
 
 				/*
 				 * The below call to StoreRelCheck() calls
@@ -3432,28 +3432,35 @@ cookDefault(ParseState *pstate,
 }
 
 /*
- * Take a raw CHECK constraint expression and convert it to a cooked format
+ * Take a raw boolean constraint expression and convert it to a cooked format
  * ready for storage.
+ *
+ * This serves both CHECK constraints and the WHERE clause of a foreign key;
+ * is_check selects between them, which affects only the wording of errors and
+ * the ParseExprKind the expression is transformed under.
  *
  * Parse state must be set up to recognize any vars that might appear
  * in the expression.
  */
-static Node *
+Node *
 cookConstraint(ParseState *pstate,
 			   Node *raw_constraint,
-			   char *relname)
+			   char *relname,
+			   bool is_check)
 {
 	Node	   *expr;
 
 	/*
 	 * Transform raw parsetree to executable expression.
 	 */
-	expr = transformExpr(pstate, raw_constraint, EXPR_KIND_CHECK_CONSTRAINT);
+	expr = transformExpr(pstate, raw_constraint,
+						 is_check ? EXPR_KIND_CHECK_CONSTRAINT :
+						 EXPR_KIND_FOREIGN_KEY_WHERE);
 
 	/*
 	 * Make sure it yields a boolean result.
 	 */
-	expr = coerce_to_boolean(pstate, expr, "CHECK");
+	expr = coerce_to_boolean(pstate, expr, is_check ? "CHECK" : "WHERE");
 
 	/*
 	 * Take care of collations.
@@ -3465,10 +3472,18 @@ cookConstraint(ParseState *pstate,
 	 * code now that add_missing_from is history).
 	 */
 	if (list_length(pstate->p_rtable) != 1)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
-				 errmsg("only table \"%s\" can be referenced in check constraint",
-						relname)));
+	{
+		if (is_check)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
+					 errmsg("only table \"%s\" can be referenced in check constraint",
+							relname)));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_COLUMN_REFERENCE),
+					 errmsg("only table \"%s\" can be referenced in foreign key WHERE condition",
+							relname)));
+	}
 
 	return expr;
 }

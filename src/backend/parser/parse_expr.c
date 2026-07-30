@@ -566,6 +566,7 @@ transformColumnRef(ParseState *pstate, ColumnRef *cref)
 		case EXPR_KIND_VALUES_SINGLE:
 		case EXPR_KIND_CHECK_CONSTRAINT:
 		case EXPR_KIND_DOMAIN_CHECK:
+		case EXPR_KIND_FOREIGN_KEY_WHERE:
 		case EXPR_KIND_FUNCTION_DEFAULT:
 		case EXPR_KIND_INDEX_EXPRESSION:
 		case EXPR_KIND_INDEX_PREDICATE:
@@ -1848,6 +1849,9 @@ transformSubLink(ParseState *pstate, SubLink *sublink)
 		case EXPR_KIND_CHECK_CONSTRAINT:
 		case EXPR_KIND_DOMAIN_CHECK:
 			err = _("cannot use subquery in check constraint");
+			break;
+		case EXPR_KIND_FOREIGN_KEY_WHERE:
+			err = _("cannot use subquery in foreign key WHERE condition");
 			break;
 		case EXPR_KIND_COLUMN_DEFAULT:
 		case EXPR_KIND_FUNCTION_DEFAULT:
@@ -3224,6 +3228,8 @@ ParseExprKindName(ParseExprKind exprKind)
 		case EXPR_KIND_CHECK_CONSTRAINT:
 		case EXPR_KIND_DOMAIN_CHECK:
 			return "CHECK";
+		case EXPR_KIND_FOREIGN_KEY_WHERE:
+			return "WHERE";
 		case EXPR_KIND_COLUMN_DEFAULT:
 		case EXPR_KIND_FUNCTION_DEFAULT:
 			return "DEFAULT";

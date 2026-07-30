@@ -68,6 +68,7 @@ typedef enum ParseExprKind
 	EXPR_KIND_VALUES_SINGLE,	/* single-row VALUES (in INSERT only) */
 	EXPR_KIND_CHECK_CONSTRAINT, /* CHECK constraint for a table */
 	EXPR_KIND_DOMAIN_CHECK,		/* CHECK constraint for a domain */
+	EXPR_KIND_FOREIGN_KEY_WHERE,	/* WHERE clause of a foreign key */
 	EXPR_KIND_COLUMN_DEFAULT,	/* default value for a table column */
 	EXPR_KIND_FUNCTION_DEFAULT, /* default parameter value for function */
 	EXPR_KIND_INDEX_EXPRESSION, /* index expression */

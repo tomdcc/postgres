@@ -256,6 +256,45 @@ alter table comment add constraint comment_blog_fk foreign key (parent_id)
 	where (parent_entity = 'blog')
 	references blog(id);
 
+--
+-- the predicate round-trips through pg_get_constraintdef
+--
+select pg_get_constraintdef(oid) from pg_constraint
+	where conrelid = 'comment'::regclass order by conname;
+\d comment
+
+-- feeding a deparsed definition back in reproduces it exactly
+alter table comment add constraint comment_blog_fk2
+	FOREIGN KEY (parent_id) WHERE ((parent_entity = 'blog'::commentable_entity))
+	REFERENCES blog(id);
+select pg_get_constraintdef(oid) from pg_constraint
+	where conrelid = 'comment'::regclass and conname = 'comment_blog_fk2';
+alter table comment drop constraint comment_blog_fk2;
+
+-- the predicate's columns are depended on, not just the key columns
+alter table comment drop column parent_entity;
+alter table comment drop constraint comment_blog_fk;
+
+--
+-- combinations that are not supported yet
+--
+create table part_comment (
+	id int4,
+	parent_entity commentable_entity not null,
+	parent_id int4
+) partition by range (id);
+alter table part_comment add constraint part_comment_blog_fk foreign key (parent_id)
+	where (parent_entity = 'blog')
+	references blog(id); -- fails
+create table part_blog (
+	id int4 primary key
+) partition by range (id);
+alter table comment add constraint comment_partblog_fk foreign key (parent_id)
+	where (parent_entity = 'blog')
+	references part_blog(id); -- fails
+drop table part_comment;
+drop table part_blog;
+
 -- cleanup
 drop table comment;
 drop table blog;

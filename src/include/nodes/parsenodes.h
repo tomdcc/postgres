@@ -2983,6 +2983,12 @@ typedef struct Constraint
 	/* Fields used for FOREIGN KEY constraints: */
 	RangeVar   *pktable;		/* Primary key table */
 	List	   *fk_attrs;		/* Attributes of foreign key */
+	Node	   *fk_where_clause;	/* Predicate restricting which rows of the
+									 * referencing table the constraint
+									 * applies to; NULL if none.  A predicate
+									 * on the referenced table, should one ever
+									 * be supported, would be the natural
+									 * flipside, as pk_where_clause */
 	List	   *pk_attrs;		/* Corresponding attrs in PK table */
 	bool		fk_with_period; /* Last attribute of FK uses PERIOD */
 	bool		pk_with_period; /* Last attribute of PK uses PERIOD */

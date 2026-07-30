@@ -849,6 +849,7 @@ CreateTriggerFiringOn(const CreateTrigStmt *stmt, const char *queryString,
 											  NULL, /* no exclusion */
 											  NULL, /* no check constraint */
 											  NULL,
+											  NULL, /* no foreign key WHERE clause */
 											  true, /* islocal */
 											  0,	/* inhcount */
 											  true, /* noinherit */

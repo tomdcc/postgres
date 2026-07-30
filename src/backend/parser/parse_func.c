@@ -2802,6 +2802,9 @@ check_srf_call_placement(ParseState *pstate, Node *last_srf, int location)
 		case EXPR_KIND_DOMAIN_CHECK:
 			err = _("set-returning functions are not allowed in check constraints");
 			break;
+		case EXPR_KIND_FOREIGN_KEY_WHERE:
+			err = _("set-returning functions are not allowed in foreign key WHERE conditions");
+			break;
 		case EXPR_KIND_COLUMN_DEFAULT:
 		case EXPR_KIND_FUNCTION_DEFAULT:
 			err = _("set-returning functions are not allowed in DEFAULT expressions");

@@ -584,7 +584,7 @@ static ObjectAddress ATAddCheckNNConstraint(List **wqueue,
 static ObjectAddress ATAddForeignKeyConstraint(List **wqueue, AlteredTableInfo *tab,
 											   Relation rel, Constraint *fkconstraint,
 											   bool recurse, bool recursing,
-											   LOCKMODE lockmode);
+											   bool is_readd, LOCKMODE lockmode);
 static int	validateFkOnDeleteSetColumns(int numfks, const int16 *fkattnums,
 										 int numfksetcols, int16 *fksetcolsattnums,
 										 List *fksetcols);
@@ -597,7 +597,7 @@ static ObjectAddress addFkConstraint(addFkConstraintSides fkside,
 									 Oid *pfeqoperators, Oid *ppeqoperators,
 									 Oid *ffeqoperators, int numfkdelsetcols,
 									 int16 *fkdelsetcols, bool is_internal,
-									 bool with_period);
+									 bool is_readd, bool with_period);
 static void addFkRecurseReferenced(Constraint *fkconstraint,
 								   Relation rel, Relation pkrel, Oid indexOid, Oid parentConstr,
 								   int numfks, int16 *pkattnum, int16 *fkattnum,
@@ -9928,7 +9928,7 @@ ATExecAddConstraint(List **wqueue, AlteredTableInfo *tab, Relation rel,
 
 			address = ATAddForeignKeyConstraint(wqueue, tab, rel,
 												newConstraint,
-												recurse, false,
+												recurse, false, is_readd,
 												lockmode);
 			break;
 
@@ -10151,7 +10151,8 @@ ATAddCheckNNConstraint(List **wqueue, AlteredTableInfo *tab, Relation rel,
 static ObjectAddress
 ATAddForeignKeyConstraint(List **wqueue, AlteredTableInfo *tab, Relation rel,
 						  Constraint *fkconstraint,
-						  bool recurse, bool recursing, LOCKMODE lockmode)
+						  bool recurse, bool recursing, bool is_readd,
+						  LOCKMODE lockmode)
 {
 	Relation	pkrel;
 	int16		pkattnum[INDEX_MAX_KEYS] = {0};
@@ -10268,6 +10269,35 @@ ATAddForeignKeyConstraint(List **wqueue, AlteredTableInfo *tab, Relation rel,
 		ereport(ERROR,
 				errcode(ERRCODE_INVALID_FOREIGN_KEY),
 				errmsg("foreign key uses PERIOD on the referenced table but not the referencing table"));
+
+	/*
+	 * A WHERE clause is not supported in combination with partitioning or with
+	 * PERIOD.  Partitioning would require mapping the predicate's column
+	 * references through to each partition, and the interaction between a
+	 * predicate and the containment tests of a temporal foreign key has not
+	 * been worked out; rather than half-support either, reject them outright.
+	 */
+	if (fkconstraint->fk_where_clause != NULL)
+	{
+		if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
+			rel->rd_rel->relispartition)
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("foreign key with WHERE clause is not supported on partitioned table \"%s\"",
+						   RelationGetRelationName(rel)));
+
+		if (pkrel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE ||
+			pkrel->rd_rel->relispartition)
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("foreign key with WHERE clause cannot reference partitioned table \"%s\"",
+						   RelationGetRelationName(pkrel)));
+
+		if (with_period)
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("foreign key with WHERE clause is not supported together with PERIOD"));
+	}
 
 	numfkdelsetcols = transformColumnNameList(RelationGetRelid(rel),
 											  fkconstraint->fk_del_set_cols,
@@ -10687,7 +10717,7 @@ ATAddForeignKeyConstraint(List **wqueue, AlteredTableInfo *tab, Relation rel,
 							  ffeqoperators,
 							  numfkdelsetcols,
 							  fkdelsetcols,
-							  false,
+							  false, is_readd,
 							  with_period);
 
 	/* Next process the action triggers at the referenced side and recurse */
@@ -10822,7 +10852,7 @@ addFkConstraint(addFkConstraintSides fkside,
 				int numfks, int16 *pkattnum,
 				int16 *fkattnum, Oid *pfeqoperators, Oid *ppeqoperators,
 				Oid *ffeqoperators, int numfkdelsetcols, int16 *fkdelsetcols,
-				bool is_internal, bool with_period)
+				bool is_internal, bool is_readd, bool with_period)
 {
 	ObjectAddress address;
 	Oid			constrOid;
@@ -10830,6 +10860,7 @@ addFkConstraint(addFkConstraintSides fkside,
 	bool		conislocal;
 	int16		coninhcount;
 	bool		connoinherit;
+	Node	   *conwhere = NULL;
 
 	/*
 	 * Verify relkind for each referenced partition.  At the top level, this
@@ -10879,6 +10910,44 @@ addFkConstraint(addFkConstraintSides fkside,
 	}
 
 	/*
+	 * If the constraint carries a WHERE clause, transform it into the cooked
+	 * form that gets stored.  The predicate is evaluated against rows of the
+	 * referencing relation, so that is what we resolve its column references
+	 * against.
+	 */
+	if (fkconstraint->fk_where_clause != NULL)
+	{
+		ParseState *pstate;
+		ParseNamespaceItem *nsitem;
+
+		pstate = make_parsestate(NULL);
+		nsitem = addRangeTableEntryForRelation(pstate,
+											   rel,
+											   AccessShareLock,
+											   NULL,
+											   false,
+											   true);
+		addNSItemToQuery(pstate, nsitem, true, true, true);
+
+		conwhere = cookConstraint(pstate, fkconstraint->fk_where_clause,
+								  RelationGetRelationName(rel),
+								  false);
+
+		/*
+		 * CreateConstraintEntry() below records the dependencies of the
+		 * predicate, including those on types.  As for other stored
+		 * expressions, checking USAGE on those types is the command path's
+		 * responsibility, and is not repeated when the server re-derives an
+		 * existing constraint for itself.
+		 */
+		if (!is_internal && !is_readd)
+			CheckUsageOnTypesInSingleRelExpr(conwhere, RelationGetRelid(rel),
+											 GetUserId());
+
+		free_parsestate(pstate);
+	}
+
+	/*
 	 * Record the FK constraint in pg_constraint.
 	 */
 	constrOid = CreateConstraintEntry(conname,
@@ -10909,6 +10978,7 @@ addFkConstraint(addFkConstraintSides fkside,
 									  NULL, /* no exclusion constraint */
 									  NULL, /* no check constraint */
 									  NULL,
+									  conwhere, /* WHERE clause, if any */
 									  conislocal,	/* islocal */
 									  coninhcount,	/* inhcount */
 									  connoinherit, /* conNoInherit */
@@ -11071,7 +11141,7 @@ addFkRecurseReferenced(Constraint *fkconstraint, Relation rel,
 									  numfks, mapped_pkattnum,
 									  fkattnum, pfeqoperators, ppeqoperators,
 									  ffeqoperators, numfkdelsetcols,
-									  fkdelsetcols, true, with_period);
+									  fkdelsetcols, true, false, with_period);
 			/* ... and recurse to our children */
 			addFkRecurseReferenced(fkconstraint, rel, partRel,
 								   partIndexId, address.objectId, numfks,
@@ -11269,7 +11339,7 @@ addFkRecurseReferencing(List **wqueue, Constraint *fkconstraint, Relation rel,
 									  numfks, pkattnum,
 									  mapped_fkattnum, pfeqoperators,
 									  ppeqoperators, ffeqoperators,
-									  numfkdelsetcols, fkdelsetcols, true,
+									  numfkdelsetcols, fkdelsetcols, true, false,
 									  with_period);
 
 			/* call ourselves to finalize the creation and we're done */
@@ -11499,7 +11569,7 @@ CloneFkReferenced(Relation parentRel, Relation partitionRel)
 								  partitionRel, partIndexId, constrOid,
 								  numfks, mapped_confkey,
 								  conkey, conpfeqop, conppeqop, conffeqop,
-								  numfkdelsetcols, confdelsetcols, false,
+								  numfkdelsetcols, confdelsetcols, false, false,
 								  constrForm->conperiod);
 		/* ... and recurse */
 		addFkRecurseReferenced(fkconstraint,
@@ -11745,7 +11815,7 @@ CloneFkReferencing(List **wqueue, Relation parentRel, Relation partRel)
 								  mapped_conkey, conpfeqop,
 								  conppeqop, conffeqop,
 								  numfkdelsetcols, confdelsetcols,
-								  false, with_period);
+								  false, false, with_period);
 
 		/* Done with the cloned constraint's tuple */
 		ReleaseSysCache(tuple);

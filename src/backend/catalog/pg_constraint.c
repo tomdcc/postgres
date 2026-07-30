@@ -79,6 +79,7 @@ CreateConstraintEntry(const char *constraintName,
 					  const Oid *exclOp,
 					  Node *conExpr,
 					  const char *conBin,
+					  Node *conWhere,
 					  bool conIsLocal,
 					  int16 conInhCount,
 					  bool conNoInherit,
@@ -248,6 +249,12 @@ CreateConstraintEntry(const char *constraintName,
 	else
 		nulls[Anum_pg_constraint_conbin - 1] = true;
 
+	if (conWhere)
+		values[Anum_pg_constraint_conwhere - 1] =
+			CStringGetTextDatum(nodeToString(conWhere));
+	else
+		nulls[Anum_pg_constraint_conwhere - 1] = true;
+
 	tup = heap_form_tuple(RelationGetDescr(conDesc), values, nulls);
 
 	CatalogTupleInsert(conDesc, tup);
@@ -388,6 +395,18 @@ CreateConstraintEntry(const char *constraintName,
 		 * expression.
 		 */
 		recordDependencyOnSingleRelExpr(&conobject, conExpr, relId,
+										DEPENDENCY_NORMAL,
+										DEPENDENCY_NORMAL, false);
+	}
+
+	if (conWhere != NULL)
+	{
+		/*
+		 * Likewise for the objects mentioned in a foreign key's WHERE clause.
+		 * The predicate is evaluated against rows of relId, so that is the
+		 * relation whose columns it may reference.
+		 */
+		recordDependencyOnSingleRelExpr(&conobject, conWhere, relId,
 										DEPENDENCY_NORMAL,
 										DEPENDENCY_NORMAL, false);
 	}

@@ -1034,6 +1034,9 @@ CREATE TABLE test11a AS (SELECT 1::priv_testdomain1 AS a);
 CREATE VIEW test16a AS SELECT ('(0,1)'::priv_testtype1).a;
 CREATE TABLE test17a (a int) PARTITION BY RANGE ((a + ('(0,1)'::priv_testtype1).a));
 CREATE POLICY priv_testpolicy1a ON test9a USING (('(0,1)'::priv_testtype1).a > 0);
+CREATE TABLE test18a (a int PRIMARY KEY);
+ALTER TABLE test9a ADD CONSTRAINT test9a_fk FOREIGN KEY (a)
+    WHERE (b > ('(0,1)'::priv_testtype1).a) REFERENCES test18a;
 
 REVOKE ALL ON TYPE priv_testtype1 FROM PUBLIC;
 
@@ -1084,6 +1087,9 @@ CREATE TABLE test11b AS (SELECT 1::priv_testdomain1 AS a);
 CREATE VIEW test16b AS SELECT ('(0,1)'::priv_testtype1).a;
 CREATE TABLE test17b (a int) PARTITION BY RANGE ((a + ('(0,1)'::priv_testtype1).a));
 CREATE POLICY priv_testpolicy1b ON test9b USING (('(0,1)'::priv_testtype1).a > 0);
+CREATE TABLE test18b (a int PRIMARY KEY);
+ALTER TABLE test9b ADD CONSTRAINT test9b_fk FOREIGN KEY (a)
+    WHERE (b > ('(0,1)'::priv_testtype1).a) REFERENCES test18b;
 
 REVOKE ALL ON TYPE priv_testtype1 FROM PUBLIC;
 
@@ -1096,6 +1102,7 @@ REVOKE USAGE ON TYPE priv_testtype1 FROM regress_priv_user2;
 SET SESSION AUTHORIZATION regress_priv_user2;
 ALTER TABLE test12 ALTER COLUMN c TYPE bigint;
 ALTER TYPE test8b ALTER ATTRIBUTE a TYPE bigint CASCADE;
+ALTER TABLE test9b ALTER COLUMN b TYPE bigint;
 ALTER TABLE test12 ALTER COLUMN c SET DEFAULT ('(0,1)'::priv_testtype1).a;
 CREATE TABLE test14 (LIKE test12 INCLUDING CONSTRAINTS);
 CREATE TABLE test15 (LIKE test13 INCLUDING DEFAULTS);
@@ -1113,6 +1120,7 @@ DROP TABLE test5b;
 DROP TABLE test6b;
 DROP TABLE test6b2;
 DROP TABLE test9b;
+DROP TABLE test18b;
 DROP TABLE test10b;
 DROP TYPE test7b;
 DROP TYPE test8b;

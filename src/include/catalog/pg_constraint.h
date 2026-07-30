@@ -166,6 +166,15 @@ CATALOG(pg_constraint,2606,ConstraintRelationId)
 	 * If a check constraint, nodeToString representation of expression
 	 */
 	pg_node_tree conbin;
+
+	/*
+	 * If a foreign key with a WHERE clause, nodeToString representation of the
+	 * predicate that a row of conrelid must satisfy for the constraint to
+	 * apply to it.  (A predicate on the referenced columns, should one ever be
+	 * supported, would be a separate column named confwhere, following the
+	 * conkey/confkey convention.)
+	 */
+	pg_node_tree conwhere;
 #endif
 } FormData_pg_constraint;
 
@@ -250,6 +259,7 @@ extern Oid	CreateConstraintEntry(const char *constraintName,
 								  const Oid *exclOp,
 								  Node *conExpr,
 								  const char *conBin,
+								  Node *conWhere,
 								  bool conIsLocal,
 								  int16 conInhCount,
 								  bool conNoInherit,

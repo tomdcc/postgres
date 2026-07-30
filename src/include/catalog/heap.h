@@ -133,6 +133,11 @@ extern Node *cookDefault(ParseState *pstate,
 						 const char *attname,
 						 char attgenerated);
 
+extern Node *cookConstraint(ParseState *pstate,
+							Node *raw_constraint,
+							char *relname,
+							bool is_check);
+
 extern void DeleteRelationTuple(Oid relid);
 extern void DeleteAttributeTuples(Oid relid);
 extern void DeleteSystemAttributeTuples(Oid relid);

@@ -2640,8 +2640,27 @@ pg_get_constraintdef_worker(Oid constraintId, bool fullCommand,
 				/* If it is a temporal foreign key then it uses PERIOD. */
 				decompile_column_index_array(val, conForm->conrelid, conForm->conperiod, &buf);
 
+				appendStringInfoChar(&buf, ')');
+
+				/* Add the WHERE clause restricting the referencing rows */
+				val = SysCacheGetAttr(CONSTROID, tup,
+									  Anum_pg_constraint_conwhere, &isnull);
+				if (!isnull)
+				{
+					Node	   *where;
+					List	   *context;
+					char	   *wheresrc;
+
+					where = stringToNode(TextDatumGetCString(val));
+					context = deparse_context_for(get_relation_name(conForm->conrelid),
+												  conForm->conrelid);
+					wheresrc = deparse_expression_pretty(where, context, false,
+														 false, prettyFlags, 0);
+					appendStringInfo(&buf, " WHERE (%s)", wheresrc);
+				}
+
 				/* add foreign relation name */
-				appendStringInfo(&buf, ") REFERENCES %s(",
+				appendStringInfo(&buf, " REFERENCES %s(",
 								 generate_relation_name(conForm->confrelid,
 														NIL));
 
