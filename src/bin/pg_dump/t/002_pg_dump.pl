@@ -4114,6 +4114,61 @@ my %tests = (
 		},
 	},
 
+	# The same on a partitioned tree, where the deferral is recorded on an
+	# index that has no storage of its own.  Such an index is indisready from
+	# the start, and stays so once REINDEX has populated the partitions and
+	# re-attaching a partition's index has made the tree valid: pg_dump
+	# selects on indisready, so an index left unready here would be dropped
+	# from the dump silently, taking the tree with it and leaving the
+	# partitions' indexes behind as standalone ones.
+	'CREATE INDEX ... WITH NO DATA (partitioned)' => {
+		create_order => 102,
+		create_sql => '
+			CREATE TABLE dump_test.nodata_parted (a int, b text)
+				PARTITION BY RANGE (a);
+			CREATE TABLE dump_test.nodata_parted1 PARTITION OF
+				dump_test.nodata_parted FOR VALUES FROM (0) TO (100);
+			CREATE INDEX nodata_parted_deferred
+				ON dump_test.nodata_parted (a) WITH NO DATA;
+			CREATE INDEX nodata_parted_done
+				ON dump_test.nodata_parted (b) WITH NO DATA;
+			REINDEX INDEX dump_test.nodata_parted_done;
+			DO $$
+			DECLARE c regclass;
+			BEGIN
+				SELECT inhrelid::regclass INTO c FROM pg_inherits
+					WHERE inhparent = \'dump_test.nodata_parted_done\'::regclass;
+				EXECUTE format(
+					\'ALTER INDEX dump_test.nodata_parted_done ATTACH PARTITION %s\', c);
+			END $$;',
+		regexp => qr/^
+			\QCREATE INDEX nodata_parted_deferred ON ONLY dump_test.nodata_parted USING btree (a) WITH NO DATA;\E
+			/xm,
+		like => {
+			%full_runs, %dump_test_schema_runs, section_post_data => 1,
+		},
+		unlike => {
+			exclude_dump_test_schema => 1,
+			only_dump_measurement => 1,
+		},
+	},
+
+	# The converted tree: populated by REINDEX and revalidated by the
+	# re-attach, so it is dumped as an ordinary index with no trace of the
+	# clause it was created with.
+	'CREATE INDEX ... WITH NO DATA (partitioned, populated)' => {
+		regexp => qr/^
+			\QCREATE INDEX nodata_parted_done ON ONLY dump_test.nodata_parted USING btree (b);\E
+			/xm,
+		like => {
+			%full_runs, %dump_test_schema_runs, section_post_data => 1,
+		},
+		unlike => {
+			exclude_dump_test_schema => 1,
+			only_dump_measurement => 1,
+		},
+	},
+
 	'CREATE INDEX ON ONLY measurement' => {
 		create_order => 92,
 		create_sql =>

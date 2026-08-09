@@ -730,6 +730,11 @@ UpdateIndexRelation(Oid indexoid,
  *			neither valid nor ready, so that queries ignore it and the
  *			executor does not maintain it.  Must be combined with
  *			INDEX_CREATE_SKIP_BUILD; a later REINDEX populates it.
+ *			A partitioned index is still marked ready: it has no storage
+ *			of its own for indisready to describe, and every other
+ *			partitioned index is created ready, so leaving it unready
+ *			would produce a flag combination no other partitioned index
+ *			can reach and that clearing indisnodata does not undo.
  *
  * constr_flags: flags passed to index_constraint_create
  *		(only if INDEX_CREATE_ADD_CONSTRAINT is set)
@@ -1073,7 +1078,7 @@ index_create(Relation heapRelation,
 						(constr_flags & INDEX_CONSTR_CREATE_DEFERRABLE) == 0 &&
 						(flags & INDEX_CREATE_DEFERRABLE) == 0,
 						!concurrent && !invalid && !nodata,
-						!concurrent && !nodata,
+						!concurrent && !(nodata && !partitioned),
 						nodata);
 
 	/*
