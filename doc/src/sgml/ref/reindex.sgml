@@ -244,6 +244,14 @@ REINDEX [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] { DA
    skip such indexes rather than populating them.
   </para>
 
+  <para>
+   Naming a partitioned index populates every partition's index and ends the
+   deferred state throughout the tree.  It does not mark the partitioned indexes
+   valid: <command>REINDEX</command> never recomputes the validity of a
+   partitioned index, whether or not it was deferred.  See
+   <xref linkend="sql-createindex-with-no-data"/> for how to do that.
+  </para>
+
   <caution>
    <para>
     <command>REINDEX INDEX CONCURRENTLY</command> on a unique index created
