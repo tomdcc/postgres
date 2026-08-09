@@ -1295,13 +1295,14 @@ DefineIndex(ParseState *pstate,
 		flags |= INDEX_CREATE_SKIP_BUILD;
 
 	/*
-	 * A partitioned index is not itself marked as having no data: it has no
-	 * storage, so there is nothing about it left unbuilt.  It is the indexes
-	 * on the partitions that are, and the partitioned index is invalid until
-	 * they are populated, by the same rule that governs any other partitioned
-	 * index whose children are not yet valid.
+	 * A partitioned index is marked too, though it has no storage of its own
+	 * to leave unbuilt.  There the flag records that the index was declared
+	 * deferred, which is what later arrivals consult: a partition attached or
+	 * created under it inherits the state rather than being built.  Only a
+	 * REINDEX naming the index clears it, in ReindexPartitions(); becoming
+	 * valid does not.
 	 */
-	if (stmt->nodata && !partitioned)
+	if (stmt->nodata)
 		flags |= INDEX_CREATE_NO_DATA;
 	if (stmt->if_not_exists)
 		flags |= INDEX_CREATE_IF_NOT_EXISTS;
@@ -3584,6 +3585,49 @@ reindex_error_callback(void *arg)
 }
 
 /*
+ * ClearPartitionedIndexNoData
+ *
+ * End the deferred state of a partitioned index.
+ *
+ * A partitioned index has no storage, so nothing is built here that could
+ * clear the flag the way reindex_index() does for a leaf.  What ends the state
+ * is the user naming the index in REINDEX INDEX, which is the explicit
+ * conversion the clause defers to; this records that it happened.  Validity is
+ * left to the rules that govern any other partitioned index.
+ *
+ * ShareUpdateExclusiveLock is enough to update the row, and is what the
+ * concurrent paths take to flip these flags elsewhere: index_concurrently_swap()
+ * clears indisnodata under it.  Taking AccessExclusiveLock here would queue
+ * behind any reader holding AccessShareLock on the index and block new planning
+ * on the table while it queued, at the end of a command that may have been run
+ * CONCURRENTLY precisely to avoid that.
+ */
+static void
+ClearPartitionedIndexNoData(Oid indexOid)
+{
+	Relation	pg_index;
+	HeapTuple	tup;
+	Form_pg_index indexForm;
+
+	LockRelationOid(indexOid, ShareUpdateExclusiveLock);
+
+	pg_index = table_open(IndexRelationId, RowExclusiveLock);
+	tup = SearchSysCacheCopy1(INDEXRELID, ObjectIdGetDatum(indexOid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for index %u", indexOid);
+	indexForm = (Form_pg_index) GETSTRUCT(tup);
+
+	if (indexForm->indisnodata)
+	{
+		indexForm->indisnodata = false;
+		CatalogTupleUpdate(pg_index, &tup->t_self, tup);
+	}
+
+	heap_freetuple(tup);
+	table_close(pg_index, RowExclusiveLock);
+}
+
+/*
  * ReindexPartitions
  *
  * Reindex a set of partitions, per the partitioned index or table given
@@ -3593,6 +3637,7 @@ static void
 ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *params, bool isTopLevel)
 {
 	List	   *partitions = NIL;
+	List	   *parted_idxs = NIL;
 	char		relkind = get_rel_relkind(relid);
 	char	   *relname = get_rel_name(relid);
 	char	   *relnamespace = get_namespace_name(get_rel_namespace(relid));
@@ -3648,10 +3693,22 @@ ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *param
 
 		/*
 		 * This discards partitioned tables, partitioned indexes and foreign
-		 * tables.
+		 * tables.  Partitioned indexes are kept aside: having no storage they
+		 * are not reindexed, but a deferred one named here is being converted
+		 * and must be marked once the partitions are done.  Save them in the
+		 * cross-transaction context, since the list below does not survive
+		 * ReindexMultipleInternal().
 		 */
 		if (!RELKIND_HAS_STORAGE(partkind))
+		{
+			if (partkind == RELKIND_PARTITIONED_INDEX)
+			{
+				old_context = MemoryContextSwitchTo(reindex_context);
+				parted_idxs = lappend_oid(parted_idxs, partoid);
+				MemoryContextSwitchTo(old_context);
+			}
 			continue;
+		}
 
 		Assert(partkind == RELKIND_INDEX ||
 			   partkind == RELKIND_RELATION);
@@ -3667,6 +3724,27 @@ ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *param
 	 * this commits and then starts a new transaction immediately.
 	 */
 	ReindexMultipleInternal(stmt, partitions, params);
+
+	/*
+	 * REINDEX INDEX names the index the user wants converted, so a deferred
+	 * tree is no longer deferred once its partitions have been reindexed.
+	 * Every partitioned index underneath the one named is part of what was
+	 * named, so the whole tree is settled by the one command.  REINDEX TABLE
+	 * names no index and converts nothing, as on a plain table.
+	 */
+	if (relkind == RELKIND_PARTITIONED_INDEX)
+	{
+		/*
+		 * ReindexMultipleInternal() leaves a transaction started but no
+		 * snapshot set, and updating a catalog needs one.
+		 */
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		foreach(lc, parted_idxs)
+			ClearPartitionedIndexNoData(lfirst_oid(lc));
+
+		PopActiveSnapshot();
+	}
 
 	/*
 	 * Clean up working storage --- note we must do this after

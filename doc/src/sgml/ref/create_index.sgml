@@ -780,12 +780,44 @@ Indexes:
 
    <para>
     On a partitioned table, <literal>WITH NO DATA</literal> defers the build of
-    the index on each partition.  The partitioned index itself is not marked as
-    having no data, having no storage of its own; it is invalid until its
-    partitions' indexes are populated, as is any partitioned index whose
-    partitions do not all have a valid index attached.  Naming it in
+    the index on each partition.  It is invalid until its partitions' indexes
+    are populated, as is any partitioned index whose partitions do not all have
+    a valid index attached.  Naming it in
     <link linkend="sql-reindex"><command>REINDEX INDEX</command></link>
     populates them all.
+   </para>
+
+   <para>
+    That <command>REINDEX</command> ends the deferred state at every level, and
+    leaves the partitioned index invalid.  <command>REINDEX</command> rebuilds
+    the indexes on the partitions and does not recompute whether a partitioned
+    index above them is valid; only
+    <link linkend="sql-alterindex"><command>ALTER INDEX ... ATTACH
+    PARTITION</command></link> does that, for any invalid partitioned index and
+    not only one deferred this way.  So re-issue that command for an
+    already-attached partition index at each level, working upwards from the
+    deepest, to mark the tree valid.  A partitioned table with no partitions has
+    nothing to re-attach, and an index on one stays invalid until a partition is
+    added and its index attached.
+   </para>
+
+   <para>
+    A partition added afterwards inherits the deferred state instead of having
+    its index built, whether it is created with
+    <link linkend="sql-createtable"><command>CREATE TABLE ... PARTITION
+    OF</command></link> or attached with
+    <link linkend="sql-altertable"><command>ALTER TABLE ... ATTACH
+    PARTITION</command></link>.  This continues until the partitioned index is
+    named in <command>REINDEX INDEX</command>, after which partitions get an
+    ordinary built index again.  Nothing else ends the deferred state; in
+    particular, attaching an index for the last partition that lacked one does
+    not, though it would otherwise leave the partitioned index valid.
+   </para>
+
+   <para>
+    Specifying <literal>ONLY</literal> defers the partitioned index without
+    creating an index on any partition, as when <literal>ONLY</literal> is used
+    without this clause.
    </para>
 
    <para>
@@ -794,7 +826,9 @@ Indexes:
     <link linkend="sql-alterindex"><command>ALTER INDEX ... ATTACH
     PARTITION</command></link>.  Note that populating it does not by itself
     re-check the partitioned index above it, so populate it before attaching if
-    that index is to become valid as a result.
+    that index is to become valid as a result.  That does not apply to a
+    partitioned index created <literal>WITH NO DATA</literal>, which stays
+    invalid until it is itself named in <command>REINDEX INDEX</command>.
    </para>
 
    <para>

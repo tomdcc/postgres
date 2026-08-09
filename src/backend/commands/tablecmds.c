@@ -1326,6 +1326,16 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 			idxstmt =
 				generateClonedIndexStmt(NULL, idxRel,
 										attmap, &constraintOid);
+
+			/*
+			 * A partition arriving under an index declared WITH NO DATA
+			 * inherits that state; generateClonedIndexStmt() reconstructs the
+			 * statement from the parent index, which does not carry it.
+			 * Otherwise the new partition would be the one member of a
+			 * deliberately deferred tree that is built and maintained.
+			 */
+			idxstmt->nodata = idxRel->rd_index->indisnodata;
+
 			DefineIndex(NULL,
 						RelationGetRelid(rel),
 						idxstmt,
@@ -21526,6 +21536,10 @@ AttachPartitionEnsureIndexes(List **wqueue, Relation rel, Relation attachrel)
 			stmt = generateClonedIndexStmt(NULL,
 										   idxRel, attmap,
 										   &conOid);
+
+			/* As in DefineRelation(), an inherited index stays deferred. */
+			stmt->nodata = idxRel->rd_index->indisnodata;
+
 			DefineIndex(NULL,
 						RelationGetRelid(attachrel), stmt, InvalidOid,
 						RelationGetRelid(idxRel),
@@ -22583,6 +22597,18 @@ validatePartitionedIndex(Relation partedIdx, Relation partedTbl)
 	bool		updated = false;
 
 	Assert(partedIdx->rd_rel->relkind == RELKIND_PARTITIONED_INDEX);
+
+	/*
+	 * An index declared WITH NO DATA is not validated as a side effect of
+	 * anything.  Attaching the last partition's index would otherwise end the
+	 * deferred state here, which is the one thing the clause promises will
+	 * happen only when asked for: the state would then depend on the order
+	 * partitions arrive in, a tree restored from a dump would differ from the
+	 * one dumped, and the next partition to arrive would be built without the
+	 * user having converted anything.  Only REINDEX naming the index ends it.
+	 */
+	if (partedIdx->rd_index->indisnodata)
+		return;
 
 	/*
 	 * Scan pg_inherits for this parent index.  Count each valid index we find

@@ -21,11 +21,22 @@ setup
     CREATE TABLE reind_nodata (id int, val int);
     INSERT INTO reind_nodata VALUES (1, 1), (2, 2);
     CREATE UNIQUE INDEX uq_nodata ON reind_nodata (val) WITH NO DATA;
+
+    -- the same, on a partitioned table: REINDEX INDEX CONCURRENTLY on the
+    -- partitioned index fans out, reaching the injection point once per
+    -- partition.  A unique index on a partitioned table must include the
+    -- partition key, so partition by the indexed column.
+    CREATE TABLE reind_nodata_p (id int, val int) PARTITION BY RANGE (val);
+    CREATE TABLE reind_nodata_p0 PARTITION OF reind_nodata_p
+      FOR VALUES FROM (0) TO (100);
+    INSERT INTO reind_nodata_p VALUES (1, 1), (2, 2);
+    CREATE UNIQUE INDEX uq_nodata_p ON reind_nodata_p (val) WITH NO DATA;
 }
 
 teardown
 {
     DROP TABLE reind_nodata;
+    DROP TABLE reind_nodata_p;
     DROP EXTENSION injection_points;
 }
 
@@ -36,6 +47,7 @@ setup
     SELECT injection_points_attach('reindex-conc-index-built', 'wait');
 }
 step reindex { REINDEX INDEX CONCURRENTLY uq_nodata; }
+step reindex_p { REINDEX INDEX CONCURRENTLY uq_nodata_p; }
 step noop1 { }
 
 session s2
@@ -62,6 +74,25 @@ step check_after {
     FROM pg_index WHERE indexrelid = 'uq_nodata'::regclass;
 }
 
+# The partitioned equivalent.  Mid-command the partition's ccnew copy is the
+# only enforcing index, exactly as for a plain table.
+step check_catalog_p {
+    SELECT c.relname, i.indisready, i.indisvalid, i.indisnodata
+    FROM pg_class c
+    JOIN pg_index i ON i.indexrelid = c.oid
+    WHERE c.relname LIKE 'uq_nodata_p%' OR c.relname LIKE 'reind_nodata_p0%'
+    ORDER BY c.relname;
+}
+step write_ok_p  { INSERT INTO reind_nodata_p VALUES (6, 9); }
+step write_dup_p { INSERT INTO reind_nodata_p VALUES (7, 9); }
+step check_after_p {
+    SELECT c.relname, i.indisready, i.indisvalid, i.indisnodata
+    FROM pg_class c
+    JOIN pg_index i ON i.indexrelid = c.oid
+    WHERE c.relname LIKE 'uq_nodata_p%' OR c.relname LIKE 'reind_nodata_p0%'
+    ORDER BY c.relname;
+}
+
 # A duplicate admitted during the unenforced window makes the reindex itself
 # fail, while building the ccnew copy -- so early that the injection point is
 # never reached, hence no wakeup here.  The index is left still unpopulated, so
@@ -71,3 +102,10 @@ permutation write_dup_before reindex detach check_after
 # With no such duplicate, the reindex completes, and ccnew enforces uniqueness
 # from the moment it goes ready -- partway through the command.
 permutation reindex check_catalog write_ok write_dup detach wakeup noop1 check_after
+
+# Fanning out over the partitions reaches the same window once per partition.
+# The partitioned index itself has no storage to rebuild, but naming it is the
+# explicit conversion a deferred index waits for, so the flag is cleared here
+# too.  Its validity is a separate question, still left to whatever rechecks the
+# partitions, so the two no longer move together.
+permutation reindex_p check_catalog_p write_ok_p write_dup_p detach wakeup noop1 check_after_p

@@ -1590,9 +1590,11 @@ CREATE INDEX CONCURRENTLY nodata_temp_idx ON nodata_temp (a) WITH NO DATA;
 DROP TABLE nodata_temp;
 
 -- accepted on a partitioned table, where it defers the build of every
--- partition's index.  It is the partitions' indexes that carry the state here;
--- the partitioned indexes are not yet marked, and are invalid until their
--- partitions' indexes are populated, as any partitioned index is.
+-- partition's index.  The partitioned indexes are marked too, though they have
+-- no storage to leave unbuilt: there the flag records that the tree was
+-- declared deferred, which is what a partition arriving later consults.  They
+-- are invalid until their partitions' indexes are populated, as any
+-- partitioned index is.
 CREATE TABLE nodata_part (a int) PARTITION BY RANGE (a);
 CREATE TABLE nodata_part_1 PARTITION OF nodata_part
   FOR VALUES FROM (1) TO (10) PARTITION BY RANGE (a);
@@ -1606,7 +1608,10 @@ SELECT c.relname, c.relkind, i.indisnodata, i.indisvalid,
   WHERE i.indrelid IN ('nodata_part'::regclass, 'nodata_part_1'::regclass,
                        'nodata_part_11'::regclass, 'nodata_part_2'::regclass)
   ORDER BY 1;
--- naming the partitioned index populates every partition's index
+-- naming the partitioned index populates every partition's index, and ends the
+-- deferred state at every level: naming it is the explicit conversion the
+-- clause waits for.  Validity is a separate question, recomputed only by the
+-- commands that recompute it for any other partitioned index.
 REINDEX INDEX nodata_part_idx;
 SELECT c.relname, c.relkind, i.indisnodata, i.indisvalid
   FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
@@ -1614,6 +1619,117 @@ SELECT c.relname, c.relkind, i.indisnodata, i.indisvalid
                        'nodata_part_11'::regclass, 'nodata_part_2'::regclass)
   ORDER BY 1;
 DROP TABLE nodata_part;
+
+-- A partition arriving under a deferred index inherits the state rather than
+-- being built, whether it is attached or created in place.  The partitioned
+-- index carries indisnodata for exactly this purpose: it has no storage of its
+-- own, so the flag records that the tree was declared deferred.
+CREATE TABLE nodata_inh (a int) PARTITION BY RANGE (a);
+CREATE TABLE nodata_inh_0 PARTITION OF nodata_inh FOR VALUES FROM (0) TO (10);
+CREATE INDEX nodata_inh_idx ON nodata_inh (a) WITH NO DATA;
+-- attached, with no index of its own
+CREATE TABLE nodata_inh_1 (a int);
+INSERT INTO nodata_inh_1 SELECT generate_series(10, 19);
+ALTER TABLE nodata_inh ATTACH PARTITION nodata_inh_1 FOR VALUES FROM (10) TO (20);
+-- created in place
+CREATE TABLE nodata_inh_2 PARTITION OF nodata_inh FOR VALUES FROM (20) TO (30);
+SELECT c.relname, c.relkind, i.indisnodata, i.indisvalid,
+       pg_relation_size(i.indexrelid) AS size
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid IN ('nodata_inh'::regclass, 'nodata_inh_0'::regclass,
+                       'nodata_inh_1'::regclass, 'nodata_inh_2'::regclass)
+  ORDER BY 1;
+-- the definition reports it, as for any other no-data index
+SELECT pg_get_indexdef('nodata_inh_idx'::regclass);
+-- a REINDEX naming the index clears the flag at every level; validity is a
+-- separate question, recomputed here by the ATTACH that follows
+REINDEX INDEX nodata_inh_idx;
+ALTER INDEX nodata_inh_idx ATTACH PARTITION nodata_inh_0_a_idx;
+SELECT c.relname, i.indisnodata, i.indisvalid
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid = 'nodata_inh'::regclass;
+SELECT pg_get_indexdef('nodata_inh_idx'::regclass);
+-- a partition attached afterwards is built, the tree no longer being deferred
+CREATE TABLE nodata_inh_3 (a int);
+ALTER TABLE nodata_inh ATTACH PARTITION nodata_inh_3 FOR VALUES FROM (30) TO (40);
+SELECT c.relname, i.indisnodata, i.indisvalid
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid = 'nodata_inh_3'::regclass;
+DROP TABLE nodata_inh;
+
+-- Nothing ends the deferred state as a side effect.  Attaching the last
+-- partition's index makes every partition valid, which would otherwise
+-- validate the tree and clear the flag -- leaving whether a tree stayed
+-- deferred to depend on the order partitions arrived in, and a tree restored
+-- from a dump differing from the one dumped, since pg_dump attaches the
+-- partition indexes after creating the parent.
+CREATE TABLE nodata_keep (a int) PARTITION BY RANGE (a);
+CREATE TABLE nodata_keep_0 PARTITION OF nodata_keep FOR VALUES FROM (0) TO (10);
+INSERT INTO nodata_keep SELECT generate_series(0, 9);
+CREATE INDEX nodata_keep_idx ON nodata_keep (a) WITH NO DATA;
+REINDEX INDEX nodata_keep_0_a_idx;
+ALTER INDEX nodata_keep_idx ATTACH PARTITION nodata_keep_0_a_idx;
+SELECT c.relname, i.indisnodata, i.indisvalid
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid = 'nodata_keep'::regclass;
+-- so a partition arriving now still inherits the deferral
+CREATE TABLE nodata_keep_1 (a int);
+INSERT INTO nodata_keep_1 SELECT generate_series(10, 19);
+ALTER TABLE nodata_keep ATTACH PARTITION nodata_keep_1 FOR VALUES FROM (10) TO (20);
+SELECT c.relname, i.indisnodata, i.indisvalid,
+       pg_relation_size(i.indexrelid) AS size
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid = 'nodata_keep_1'::regclass;
+-- naming the index is what ends it; validity is then recomputed as usual
+REINDEX INDEX nodata_keep_idx;
+SELECT c.relname, i.indisnodata, i.indisvalid
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid = 'nodata_keep'::regclass;
+ALTER INDEX nodata_keep_idx ATTACH PARTITION nodata_keep_0_a_idx;
+SELECT c.relname, i.indisnodata, i.indisvalid
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid = 'nodata_keep'::regclass;
+DROP TABLE nodata_keep;
+
+-- ON ONLY defers the partitioned index alone, creating no partition indexes;
+-- this is the form pg_dump emits, since a partitioned index is always dumped
+-- ON ONLY with the partitions attached afterwards
+CREATE TABLE nodata_only (a int) PARTITION BY RANGE (a);
+CREATE TABLE nodata_only_0 PARTITION OF nodata_only FOR VALUES FROM (0) TO (10);
+CREATE INDEX nodata_only_idx ON ONLY nodata_only (a) WITH NO DATA;
+SELECT c.relname, i.indisnodata, i.indisvalid
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid IN ('nodata_only'::regclass, 'nodata_only_0'::regclass)
+  ORDER BY 1;
+DROP TABLE nodata_only;
+
+-- Recursion attaches an equivalent existing index where it finds one rather
+-- than creating another, so a tree whose partitions are all already indexed
+-- has no build to defer at this moment.  The index is still marked, and still
+-- awaits an explicit validation: the clause declares what the tree is for from
+-- here on, which is not answerable from what happens to be attached when the
+-- command runs.  Deciding it was a no-op would make the state depend on that
+-- accident of timing, and would grant a validity the user did not ask for.
+CREATE TABLE nodata_match (a int) PARTITION BY RANGE (a);
+CREATE TABLE nodata_match_0 PARTITION OF nodata_match FOR VALUES FROM (0) TO (10);
+CREATE INDEX nodata_match_0_a ON nodata_match_0 (a);
+CREATE INDEX nodata_match_idx ON nodata_match (a) WITH NO DATA;
+SELECT c.relname, i.indisnodata, i.indisvalid
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid IN ('nodata_match'::regclass, 'nodata_match_0'::regclass)
+  ORDER BY 1;
+-- the partition keeps the index it arrived with, untouched
+SELECT pg_relation_size('nodata_match_0_a'::regclass) > 0 AS populated;
+-- and a partition attached meanwhile inherits the deferral, as under any other
+-- index still awaiting one
+CREATE TABLE nodata_match_1 (a int);
+INSERT INTO nodata_match_1 SELECT generate_series(10, 19);
+ALTER TABLE nodata_match ATTACH PARTITION nodata_match_1 FOR VALUES FROM (10) TO (20);
+SELECT c.relname, i.indisnodata, i.indisvalid,
+       pg_relation_size(i.indexrelid) AS size
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid = 'nodata_match_1'::regclass;
+DROP TABLE nodata_match;
 
 -- rejected on system catalogs, whose scans do not consult indisvalid
 SET allow_system_table_mods = on;
