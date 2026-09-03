@@ -646,6 +646,44 @@ select relname, indisvalid from pg_class join pg_index on indexrelid = oid
 (3 rows)
 
 drop table idxpart;
+-- Attaching a partition whose own index cannot be built valid must not leave a
+-- valid index above an invalid one.  The index for the partition being
+-- attached is created below an ancestor that already exists and is already
+-- valid, so nothing in that creation revisits the ancestor.
+create function idxpart_f(int) returns int
+  immutable language sql as 'select $1 / 0';
+create table idxpart (a int) partition by range (a);
+create table idxpart1 partition of idxpart for values from (0) to (10);
+create index idxpart_f_idx on idxpart (idxpart_f(a));
+-- a subtree carrying an index that a failed concurrent build left invalid
+create table idxpart2 (a int) partition by range (a);
+create table idxpart21 partition of idxpart2 for values from (10) to (20);
+insert into idxpart21 values (11);
+create index concurrently idxpart21_f_idx on idxpart21 (idxpart_f(a));
+ERROR:  division by zero
+select relname, indisvalid from pg_class join pg_index on indexrelid = oid
+   where relname like 'idxpart%idx%' order by relname;
+         relname          | indisvalid 
+--------------------------+------------
+ idxpart1_idxpart_f_a_idx | t
+ idxpart21_f_idx          | f
+ idxpart_f_idx            | t
+(3 rows)
+
+alter table idxpart attach partition idxpart2 for values from (10) to (20);
+-- every index above the invalid one is invalid too
+select relname, indisvalid from pg_class join pg_index on indexrelid = oid
+   where relname like 'idxpart%idx%' order by relname;
+         relname          | indisvalid 
+--------------------------+------------
+ idxpart1_idxpart_f_a_idx | t
+ idxpart21_f_idx          | f
+ idxpart2_idxpart_f_a_idx | f
+ idxpart_f_idx            | f
+(4 rows)
+
+drop table idxpart, idxpart2;
+drop function idxpart_f(int);
 -- verify dependency handling during ALTER TABLE DETACH PARTITION
 create table idxpart (a int) partition by range (a);
 create table idxpart1 (like idxpart);

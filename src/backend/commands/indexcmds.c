@@ -28,6 +28,7 @@
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/partition.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_collation.h"
@@ -146,6 +147,66 @@ typedef struct ReindexErrorInfo
 	char	   *relnamespace;
 	char		relkind;
 } ReindexErrorInfo;
+
+/*
+ * InvalidateParentIndexes
+ *		Mark every ancestor of the given partitioned index invalid.
+ *
+ * A partitioned index is valid only while every one of its partitions has a
+ * valid index attached, so an index that has just been marked invalid must not
+ * be left below an ancestor that is still marked valid.  DefineIndex()
+ * maintains that as it recurses, since each level it creates learns from the
+ * level below and marks itself invalid in turn.  What it cannot see is an
+ * ancestor that already existed and was already valid: ALTER TABLE ... ATTACH
+ * PARTITION creates the index for the partition being attached with such an
+ * ancestor as its parent, and nothing revisits that ancestor afterwards.
+ *
+ * The walk stops at the first ancestor already marked invalid, whose own
+ * ancestors are invalid in turn by the same rule.
+ *
+ * Locking matches validatePartitionedIndex()'s walk in the other direction --
+ * AccessExclusiveLock on each index, taken from the bottom up -- so the two
+ * cannot be interleaved in opposite orders.
+ */
+static void
+InvalidateParentIndexes(Oid indexRelationId)
+{
+	Oid			curidx = indexRelationId;
+
+	while (get_rel_relispartition(curidx))
+	{
+		Oid			parentIdxId = get_partition_parent(curidx, false);
+		Relation	parentIdx;
+		Relation	pg_index;
+		HeapTuple	tup,
+					newtup;
+
+		if (get_index_isvalid(parentIdxId))
+		{
+			parentIdx = index_open(parentIdxId, AccessExclusiveLock);
+
+			pg_index = table_open(IndexRelationId, RowExclusiveLock);
+			tup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(parentIdxId));
+			if (!HeapTupleIsValid(tup))
+				elog(ERROR, "cache lookup failed for index %u", parentIdxId);
+			newtup = heap_copytuple(tup);
+			((Form_pg_index) GETSTRUCT(newtup))->indisvalid = false;
+			CatalogTupleUpdate(pg_index, &tup->t_self, newtup);
+			ReleaseSysCache(tup);
+			table_close(pg_index, RowExclusiveLock);
+			heap_freetuple(newtup);
+
+			index_close(parentIdx, NoLock);
+
+			/* make the update visible to the next level up */
+			CommandCounterIncrement();
+		}
+		else
+			break;
+
+		curidx = parentIdxId;
+	}
+}
 
 /*
  * CheckIndexCompatible
@@ -1608,6 +1669,12 @@ DefineIndex(ParseState *pstate,
 				 * across multiple partition levels.
 				 */
 				CommandCounterIncrement();
+
+				/*
+				 * An ancestor that already existed is not part of that
+				 * recursion, and must be invalidated here.
+				 */
+				InvalidateParentIndexes(indexRelationId);
 			}
 		}
 
