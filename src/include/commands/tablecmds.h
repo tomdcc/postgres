@@ -103,6 +103,9 @@ extern void RangeVarCallbackMaintainsTable(const RangeVar *relation,
 										   Oid relId, Oid oldRelId,
 										   void *arg);
 
+extern bool validatePartitionedIndex(Relation partedIdx, Relation partedTbl,
+									 bool validate_parent);
+
 extern void RangeVarCallbackOwnsRelation(const RangeVar *relation,
 										 Oid relId, Oid oldRelId, void *arg);
 extern bool PartConstraintImpliedByRelConstraint(Relation scanrel,
