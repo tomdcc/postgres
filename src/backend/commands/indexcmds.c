@@ -28,6 +28,7 @@
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
+#include "catalog/partition.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_collation.h"
@@ -81,6 +82,16 @@ typedef struct CIEN_context
 } CIEN_context;
 
 /* non-export function prototypes */
+/*
+ * What a validity recheck did to one partitioned index, for VERBOSE reporting.
+ */
+typedef enum ReindexValidityOutcome
+{
+	REINDEX_VALIDITY_MARKED,	/* the recheck marked it valid */
+	REINDEX_VALIDITY_UNCHANGED, /* it was already valid; nothing to do */
+	REINDEX_VALIDITY_INCOMPLETE,	/* it cannot be marked valid yet */
+}			ReindexValidityOutcome;
+
 static bool CompareOpclassOptions(const Datum *opts1, const Datum *opts2, int natts);
 static void CheckPredicate(Expr *predicate);
 static void ComputeIndexAttrs(ParseState *pstate,
@@ -118,6 +129,11 @@ static Oid	ReindexTable(const ReindexStmt *stmt, const ReindexParams *params,
 static void ReindexMultipleTables(const ReindexStmt *stmt,
 								  const ReindexParams *params);
 static void reindex_error_callback(void *arg);
+static void ReindexReportValidity(Oid idxoid, ReindexValidityOutcome outcome,
+								  const ReindexParams *params);
+static Oid	ReindexParentIndexOid(Oid indOid);
+static void ReindexReportInvalidParent(Oid parentOid);
+static void ReindexValidateOnly(Oid indOid, const ReindexParams *params);
 static void ReindexPartitions(const ReindexStmt *stmt, Oid relid,
 							  const ReindexParams *params, bool isTopLevel);
 static void ReindexMultipleInternal(const ReindexStmt *stmt, const List *relids,
@@ -3009,6 +3025,7 @@ ExecReindex(ParseState *pstate, const ReindexStmt *stmt, bool isTopLevel)
 	ListCell   *lc;
 	bool		concurrently = false;
 	bool		verbose = false;
+	bool		validity_only = false;
 	char	   *tablespacename = NULL;
 
 	/* Parse option list */
@@ -3020,6 +3037,8 @@ ExecReindex(ParseState *pstate, const ReindexStmt *stmt, bool isTopLevel)
 			verbose = defGetBoolean(opt);
 		else if (strcmp(opt->defname, "concurrently") == 0)
 			concurrently = defGetBoolean(opt);
+		else if (strcmp(opt->defname, "validity_only") == 0)
+			validity_only = defGetBoolean(opt);
 		else if (strcmp(opt->defname, "tablespace") == 0)
 			tablespacename = defGetString(opt);
 		else
@@ -3030,13 +3049,61 @@ ExecReindex(ParseState *pstate, const ReindexStmt *stmt, bool isTopLevel)
 					 parser_errposition(pstate, opt->location)));
 	}
 
+	/*
+	 * Reject the unusable combinations before PreventInTransactionBlock(), so
+	 * that the specific complaint wins over the generic one about
+	 * CONCURRENTLY.
+	 *
+	 * VALIDITY_ONLY suppresses the rebuilding of indexes on partitions, so it
+	 * is meaningful only for a single index; the bulk forms have no such
+	 * rebuilding to suppress.
+	 */
+	if (validity_only && stmt->kind != REINDEX_OBJECT_INDEX)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("REINDEX option VALIDITY_ONLY is not supported by this form of REINDEX"),
+				 errhint("VALIDITY_ONLY may be used with REINDEX INDEX.")));
+
+	/*
+	 * CONCURRENTLY describes how to rebuild an index without blocking
+	 * writers. VALIDITY_ONLY rebuilds nothing, so the two ask for
+	 * contradictory things and accepting both would silently ignore one of
+	 * them.  Rejecting the combination also keeps VALIDITY_ONLY usable inside
+	 * a transaction block, which CONCURRENTLY otherwise forbids for a rebuild
+	 * that is not happening.
+	 */
+	if (validity_only && concurrently)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("REINDEX option VALIDITY_ONLY cannot be used with CONCURRENTLY"),
+				 errdetail("VALIDITY_ONLY rebuilds nothing, so there is nothing to do concurrently.")));
+
+	/*
+	 * TABLESPACE moves an index by rebuilding it there, so with nothing
+	 * rebuilt there is no storage to move and the clause could not be obeyed
+	 * for any index.  Silently ignoring it would be worse here than the
+	 * conditional no-op it already is elsewhere: REINDEX (TABLESPACE ...)
+	 * without VALIDITY_ONLY declines to move an index only when it is already
+	 * where it was asked to be, whereas with VALIDITY_ONLY the clause can
+	 * never do anything at all.  The hint names the command that does change
+	 * where a partitioned index's future partitions are placed, since that is
+	 * what someone combining the two is likely to be after.
+	 */
+	if (validity_only && tablespacename != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("REINDEX option VALIDITY_ONLY cannot be used with TABLESPACE"),
+				 errdetail("VALIDITY_ONLY rebuilds nothing, so there is no index storage to move."),
+				 errhint("Use ALTER TABLE ONLY ... SET TABLESPACE on the partitioned index instead.")));
+
 	if (concurrently)
 		PreventInTransactionBlock(isTopLevel,
 								  "REINDEX CONCURRENTLY");
 
 	params.options =
 		(verbose ? REINDEXOPT_VERBOSE : 0) |
-		(concurrently ? REINDEXOPT_CONCURRENTLY : 0);
+		(concurrently ? REINDEXOPT_CONCURRENTLY : 0) |
+		(validity_only ? REINDEXOPT_VALIDITY_ONLY : 0);
 
 	/*
 	 * Assign the tablespace OID to move indexes to, with InvalidOid to do
@@ -3111,6 +3178,16 @@ ReindexIndex(const ReindexStmt *stmt, const ReindexParams *params, bool isTopLev
 	 * obtain lock on table first, to avoid deadlock hazard.  The lock level
 	 * used here must match the index lock obtained in reindex_index().
 	 *
+	 * VALIDITY_ONLY rebuilds nothing, so it needs no more than what marking
+	 * one catalog row valid requires, and takes ShareUpdateExclusiveLock like
+	 * the descendants it goes on to recheck.  The stronger levels would block
+	 * writes across the whole partition tree -- ShareLock on the partitioned
+	 * table conflicts with the RowExclusiveLock that routing an insert
+	 * through it takes -- for a command that touches no data at all.  This is
+	 * safe only because VALIDITY_ONLY is rejected below for anything but a
+	 * partitioned index; a rebuild reached with this lock level would have to
+	 * upgrade.
+	 *
 	 * If it's a temporary index, we will perform a non-concurrent reindex,
 	 * even if CONCURRENTLY was requested.  In that case, reindex_index() will
 	 * upgrade the lock, but that's OK, because other sessions can't hold
@@ -3119,7 +3196,9 @@ ReindexIndex(const ReindexStmt *stmt, const ReindexParams *params, bool isTopLev
 	state.params = *params;
 	state.locked_table_oid = InvalidOid;
 	indOid = RangeVarGetRelidExtended(indexRelation,
-									  (params->options & REINDEXOPT_CONCURRENTLY) != 0 ?
+									  (params->options &
+									   (REINDEXOPT_CONCURRENTLY |
+										REINDEXOPT_VALIDITY_ONLY)) != 0 ?
 									  ShareUpdateExclusiveLock : AccessExclusiveLock,
 									  0,
 									  RangeVarCallbackForReindexIndex,
@@ -3132,17 +3211,65 @@ ReindexIndex(const ReindexStmt *stmt, const ReindexParams *params, bool isTopLev
 	persistence = get_rel_persistence(indOid);
 	relkind = get_rel_relkind(indOid);
 
+	/*
+	 * VALIDITY_ONLY asks for the one thing a partitioned index can be given
+	 * without rebuilding anything.  An index with storage has no such state
+	 * to recheck, so rather than silently doing an ordinary rebuild -- the
+	 * opposite of what VALIDITY_ONLY asks for, and under a lock level chosen
+	 * on the assumption that no rebuild would happen -- refuse it.
+	 */
+	if ((params->options & REINDEXOPT_VALIDITY_ONLY) != 0 &&
+		relkind != RELKIND_PARTITIONED_INDEX)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("cannot use VALIDITY_ONLY on non-partitioned index \"%s.%s\"",
+						get_namespace_name(get_rel_namespace(indOid)),
+						get_rel_name(indOid))));
+
 	if (relkind == RELKIND_PARTITIONED_INDEX)
-		ReindexPartitions(stmt, indOid, params, isTopLevel);
+	{
+		/*
+		 * With VALIDITY_ONLY, do not rebuild the indexes on the partitions. A
+		 * partitioned index has no storage of its own, so nothing is rebuilt
+		 * at all; what remains is to recheck whether it, and the partitioned
+		 * indexes beneath it, can be marked valid given the indexes their
+		 * partitions currently have.  That makes VALIDITY_ONLY the cheap way
+		 * to repair a tree whose leaves have already been fixed individually.
+		 */
+		if ((params->options & REINDEXOPT_VALIDITY_ONLY) != 0)
+			ReindexValidateOnly(indOid, params);
+		else
+			ReindexPartitions(stmt, indOid, params, isTopLevel);
+	}
 	else if ((params->options & REINDEXOPT_CONCURRENTLY) != 0 &&
 			 persistence != RELPERSISTENCE_TEMP)
-		ReindexRelationConcurrently(stmt, indOid, params);
+	{
+		/*
+		 * Resolve the parent before the rebuild.  REINDEX CONCURRENTLY leaves
+		 * a different index in place of the one it was given, so indOid names
+		 * a dropped index by the time it returns; the parent is untouched,
+		 * and the new index hangs from it just as the old one did.
+		 */
+		Oid			parentOid = ReindexParentIndexOid(indOid);
+
+		/* nothing rebuilt leaves nothing to report on */
+		if (ReindexRelationConcurrently(stmt, indOid, params))
+			ReindexReportInvalidParent(parentOid);
+	}
 	else
 	{
 		ReindexParams newparams = *params;
 
 		newparams.options |= REINDEXOPT_REPORT_PROGRESS;
 		reindex_index(stmt, indOid, false, persistence, &newparams);
+
+		/*
+		 * Rebuilding a partition's index leaves its parent alone in just the
+		 * way the partitioned forms above do, so the parent can still be
+		 * invalid -- most often with this leaf as the reason it went invalid
+		 * in the first place.  Report it on the same terms.
+		 */
+		ReindexReportInvalidParent(ReindexParentIndexOid(indOid));
 	}
 }
 
@@ -3164,9 +3291,13 @@ RangeVarCallbackForReindexIndex(const RangeVar *relation,
 	/*
 	 * Lock level here should match table lock in reindex_index() for
 	 * non-concurrent case and table locks used by index_concurrently_*() for
-	 * concurrent case.
+	 * concurrent case.  VALIDITY_ONLY rebuilds nothing and only ever applies
+	 * to a partitioned index, so it needs no more than ReindexValidateOnly()
+	 * takes on the levels below; ShareLock here would block writes across the
+	 * whole tree for a command that touches no data.
 	 */
-	table_lockmode = (state->params.options & REINDEXOPT_CONCURRENTLY) != 0 ?
+	table_lockmode = (state->params.options &
+					  (REINDEXOPT_CONCURRENTLY | REINDEXOPT_VALIDITY_ONLY)) != 0 ?
 		ShareUpdateExclusiveLock : ShareLock;
 
 	/*
@@ -3518,6 +3649,302 @@ reindex_error_callback(void *arg)
 	else if (errinfo->relkind == RELKIND_PARTITIONED_INDEX)
 		errcontext("while reindexing partitioned index \"%s.%s\"",
 				   errinfo->relnamespace, errinfo->relname);
+}
+
+/*
+ * ReindexReportValidity
+ *		Say what a validity recheck did, under VERBOSE.
+ *
+ * Marking a partitioned index valid leaves no other trace in the command's
+ * output, and an index the recheck could not validate is the reason its tree
+ * stays unusable, so both are worth a line once progress reports have been
+ * asked for.  Silence is still the default: the recheck is bookkeeping that
+ * happens whether or not anyone is watching.
+ *
+ * The index the user named is reported even when it was already valid, since
+ * REINDEX (VERBOSE) reports the object it was given in every other form, and
+ * answering "is this index valid" with silence would be a poor reply to the
+ * one command whose whole purpose is to ask.  Levels below it are reported
+ * only when they change; listing every already-valid level of a deep tree
+ * would bury the ones that did.
+ */
+static void
+ReindexReportValidity(Oid idxoid, ReindexValidityOutcome outcome,
+					  const ReindexParams *params)
+{
+	if ((params->options & REINDEXOPT_VERBOSE) == 0)
+		return;
+
+	switch (outcome)
+	{
+		case REINDEX_VALIDITY_MARKED:
+			ereport(INFO,
+					(errmsg("index \"%s.%s\" was marked valid",
+							get_namespace_name(get_rel_namespace(idxoid)),
+							get_rel_name(idxoid))));
+			break;
+		case REINDEX_VALIDITY_UNCHANGED:
+			ereport(INFO,
+					(errmsg("index \"%s.%s\" is already valid",
+							get_namespace_name(get_rel_namespace(idxoid)),
+							get_rel_name(idxoid))));
+			break;
+		case REINDEX_VALIDITY_INCOMPLETE:
+			ereport(INFO,
+					(errmsg("index \"%s.%s\" could not be marked valid",
+							get_namespace_name(get_rel_namespace(idxoid)),
+							get_rel_name(idxoid)),
+					 errdetail("Not every partition has a valid index attached to it.")));
+			break;
+	}
+}
+
+/*
+ * ReindexParentIndexOid
+ *		OID of the index the given index is a partition of, or InvalidOid.
+ */
+static Oid
+ReindexParentIndexOid(Oid indOid)
+{
+	if (!get_rel_relispartition(indOid))
+		return InvalidOid;
+
+	/*
+	 * even_if_detached, because the parent's identity is all that is wanted
+	 * here and a detach in progress is no reason to fail a command that got
+	 * this far.
+	 */
+	return get_partition_parent(indOid, true);
+}
+
+/*
+ * ReindexReportInvalidParent
+ *		Report that the index above the one named is still invalid.
+ *
+ * REINDEX never modifies an index above the one the user named, so making the
+ * index named valid can complete the tree below its parent while leaving the
+ * parent itself invalid.  Nothing in the command's output shows that, and the
+ * command has just reported success, so say so: the parent is one
+ * REINDEX (VALIDITY_ONLY) away from valid, and a user who does not know that
+ * is left with an unusable index and no indication of why.
+ *
+ * The caller must have established that the index named is now valid, whether
+ * by validating it or by rebuilding it.  A rebuild's own catalog update is not
+ * visible to a syscache lookup until the next command, so there is nothing to
+ * be gained by testing that index's flag here.
+ *
+ * The parent is read without a lock, which is enough for a message.  A
+ * concurrent validation can only make the report stale, and locking it would
+ * mean taking an ancestor lock while holding descendant ones for the sake of a
+ * NOTICE.  Callers holding a lock on the index named also hold
+ * the parent in place, since dropping it would have to lock this index too,
+ * but the concurrent path does not, so a vanished parent is passed over rather
+ * than reported on.
+ */
+static void
+ReindexReportInvalidParent(Oid parentOid)
+{
+	HeapTuple	tuple;
+	bool		isvalid;
+
+	if (!OidIsValid(parentOid))
+		return;
+
+	tuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(parentOid));
+	if (!HeapTupleIsValid(tuple))
+		return;
+	isvalid = ((Form_pg_index) GETSTRUCT(tuple))->indisvalid;
+	ReleaseSysCache(tuple);
+
+	if (isvalid)
+		return;
+
+	ereport(NOTICE,
+			(errmsg("parent index \"%s.%s\" is still invalid",
+					get_namespace_name(get_rel_namespace(parentOid)),
+					get_rel_name(parentOid)),
+			 errdetail("REINDEX does not modify indexes above the one named."),
+			 errhint("Use REINDEX (VALIDITY_ONLY) on that index to recheck it.")));
+}
+
+/*
+ * ReindexValidateOnly
+ *		Recheck whether a partitioned index can be marked valid.
+ *
+ * A partitioned index is valid only while every partition has a valid index
+ * attached to it, and nothing recomputes that when a child index becomes valid
+ * again.  This rechecks the condition for the index given and for the
+ * partitioned indexes beneath it, without rebuilding anything.
+ *
+ * VALIDITY_ONLY suppresses the recursion that rebuilds indexes on the
+ * partitions, which is the expensive part, leaving only the recheck that gives
+ * the option its name.  It does not suppress the catalog bookkeeping: an
+ * intermediate index
+ * whose own children are now valid is marked valid too, since a partitioned
+ * index cannot become valid before its children are, and leaving a complete
+ * level marked invalid serves nobody.  Working deepest first means one pass
+ * settles a tree of any depth.
+ *
+ * Deliberately does not ascend to the parent: REINDEX must not modify catalog
+ * entries for indexes above the one the user named.  Descending also takes the
+ * locks in the order RangeVarCallbackForReindexIndex() and ReindexPartitions()
+ * already establish, and at a weaker level than an ascent would need.  It does
+ * not make the command deadlock-free: ATTACH PARTITION locks the parent index
+ * before the child and then ascends, so it holds locks in both directions, and
+ * a descent that holds an ancestor while waiting for one of its descendants
+ * can cycle with it.  REINDEX INDEX on a partitioned index already can, for
+ * the same reason and by the same pair of locks.
+ *
+ * The caller must already hold a lock on the index.
+ */
+static void
+ReindexValidateOnly(Oid indOid, const ReindexParams *params)
+{
+	List	   *inhoids;
+	Relation	partedTbl;
+	Relation	partedIdx;
+
+	/*
+	 * Enumerate the tree without locking, and take the locks below, one
+	 * relation at a time, table before index.  Locking here instead would
+	 * take every descendant index lock before any of their table locks, which
+	 * is the reverse of the order RangeVarCallbackForReindexIndex()
+	 * establishes for the index named, and would deadlock against a
+	 * concurrent REINDEX INDEX on one of those descendants.
+	 * ReindexPartitions() can lock the whole tree up front because
+	 * ReindexMultipleInternal() commits before any per-relation locking,
+	 * dropping those locks again; there is no such commit here.
+	 *
+	 * Nothing is lost by not holding the tree: a partition attached after
+	 * this scan is simply not visited, and cannot cause a wrong answer,
+	 * because validatePartitionedIndex() recounts the partitions under the
+	 * lock taken below and refuses to validate an index whose count no longer
+	 * matches. Note that the tree-wide lock would not have prevented that
+	 * anyway, since ATTACH PARTITION needs only ShareUpdateExclusiveLock on
+	 * the table and AccessShareLock on the parent index, neither of which it
+	 * conflicts with.
+	 *
+	 * The list can therefore name relations that have since been dropped, as
+	 * find_all_inheritors() only rechecks that under a lock; try_*_open()
+	 * below copes, as it does in ReindexMultipleTables().
+	 */
+	inhoids = find_all_inheritors(indOid, NoLock, NULL);
+
+	/*
+	 * Recheck the partitioned indexes beneath the one named, deepest first:
+	 * validatePartitionedIndex() never descends, so an intermediate index has
+	 * to be validated before the level above it can be. find_all_inheritors()
+	 * returns breadth-first -- and sorts each level by OID whether or not it
+	 * locks -- so iterating in reverse visits the deepest first, in an order
+	 * every backend agrees on.  Entry 0 is indOid itself, handled below,
+	 * where failing to validate is an error rather than something to pass
+	 * over.
+	 */
+	for (int i = list_length(inhoids) - 1; i > 0; i--)
+	{
+		Oid			idxoid = list_nth_oid(inhoids, i);
+		Relation	tbl;
+		Relation	idx;
+		Oid			tbloid;
+		bool		validated;
+
+		/*
+		 * leaf indexes have nothing to recheck; they are valid or they are
+		 * not
+		 */
+		if (get_rel_relkind(idxoid) != RELKIND_PARTITIONED_INDEX)
+			continue;
+
+		/*
+		 * Skip those already valid, including from a deeper level just done.
+		 * Note this skips the entry rather than ending the descent.  A valid
+		 * partitioned index is meant to imply that everything below it is
+		 * valid -- see cfc43aeb381, which calls a valid parent above an
+		 * invalid child something that should not happen -- but ATTACH
+		 * PARTITION can still produce exactly that, by creating an index for
+		 * the partition being attached below an ancestor that already exists
+		 * and is already valid, and adopting an invalid index beneath it.
+		 * Repairing such a tree is precisely what this command is useful for,
+		 * so do not rely on the invariant to prune the descent.
+		 */
+		if (get_index_isvalid(idxoid))
+			continue;
+
+		/*
+		 * Lock the table before the index, matching the order that
+		 * RangeVarCallbackForReindexIndex() takes for the index named.  The
+		 * relation may have gone away since the unlocked scan above.
+		 */
+		tbloid = IndexGetRelation(idxoid, true);
+		if (!OidIsValid(tbloid))
+			continue;
+		tbl = try_table_open(tbloid, ShareUpdateExclusiveLock);
+		if (tbl == NULL)
+			continue;
+		idx = try_index_open(idxoid, ShareUpdateExclusiveLock);
+		if (idx == NULL)
+		{
+			table_close(tbl, NoLock);
+			continue;
+		}
+
+		/* recheck now that it cannot change under us */
+		if (idx->rd_index->indisvalid)
+		{
+			index_close(idx, NoLock);
+			table_close(tbl, NoLock);
+			continue;
+		}
+
+		validated = validatePartitionedIndex(idx, tbl, false);
+
+		index_close(idx, NoLock);
+		table_close(tbl, NoLock);
+
+		ReindexReportValidity(idxoid,
+							  validated ? REINDEX_VALIDITY_MARKED :
+							  REINDEX_VALIDITY_INCOMPLETE,
+							  params);
+
+		/* make the update visible to the level above */
+		CommandCounterIncrement();
+	}
+
+	/* Table before index, as for the descendants above */
+	partedTbl = table_open(IndexGetRelation(indOid, false),
+						   ShareUpdateExclusiveLock);
+	partedIdx = index_open(indOid, ShareUpdateExclusiveLock);
+
+	/*
+	 * Validating the index named is the whole of what was asked for, so
+	 * failing to do so is an error, as it would be for any other REINDEX that
+	 * could not produce a usable index.  The error aborts the transaction,
+	 * and the descendants marked valid above are rolled back with it -- there
+	 * are no intermediate commits here, unlike ReindexPartitions().  So the
+	 * command is all or nothing: either the index named ends up valid, or the
+	 * tree is left exactly as it was found.
+	 */
+	if (get_index_isvalid(indOid))
+		ReindexReportValidity(indOid, REINDEX_VALIDITY_UNCHANGED, params);
+	else
+	{
+		if (!validatePartitionedIndex(partedIdx, partedTbl, false))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("index \"%s.%s\" could not be marked valid",
+							get_namespace_name(RelationGetNamespace(partedIdx)),
+							RelationGetRelationName(partedIdx)),
+					 errdetail("Not every partition has a valid index attached to it."),
+					 errhint("Repair or attach the remaining partition indexes first; VALIDITY_ONLY does not rebuild them.")));
+
+		ReindexReportValidity(indOid, REINDEX_VALIDITY_MARKED, params);
+	}
+
+	index_close(partedIdx, NoLock);
+	table_close(partedTbl, NoLock);
+
+	/* the index named is valid now, whether or not we made it so */
+	ReindexReportInvalidParent(ReindexParentIndexOid(indOid));
 }
 
 /*

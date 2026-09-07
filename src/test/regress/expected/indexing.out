@@ -584,6 +584,9 @@ select relname, indisvalid from pg_class join pg_index on indexrelid = oid
 -- fix the index on the leaf partition
 delete from idxpart11 where b = 0;
 reindex index concurrently idxpart11_a_b_idx;
+NOTICE:  parent index "public.idxpart1_a_b_idx" is still invalid
+DETAIL:  REINDEX does not modify indexes above the one named.
+HINT:  Use REINDEX (VALIDITY_ONLY) on that index to recheck it.
 -- reattach the leaf partition index; parents should now be valid
 alter index idxpart1_a_b_idx attach partition idxpart11_a_b_idx;
 select relname, indisvalid from pg_class join pg_index on indexrelid = oid
@@ -634,6 +637,9 @@ select relname, indisvalid from pg_class join pg_index on indexrelid = oid
 -- fix only idxpart1's index, leave idxpart2's still invalid
 delete from idxpart1 where b = 0;
 reindex index concurrently idxpart1_a_b_idx;
+NOTICE:  parent index "public.idxpart_a_b_idx" is still invalid
+DETAIL:  REINDEX does not modify indexes above the one named.
+HINT:  Use REINDEX (VALIDITY_ONLY) on that index to recheck it.
 -- re-attach the fixed child; parent should stay invalid
 alter index idxpart_a_b_idx attach partition idxpart1_a_b_idx;
 select relname, indisvalid from pg_class join pg_index on indexrelid = oid
@@ -1696,6 +1702,257 @@ select indexrelid::regclass, indisvalid,
 (5 rows)
 
 drop table parted_isvalid_tab;
+-- VALIDITY_ONLY settles a tree of any depth in one command: with the leaf
+-- repaired directly, naming the top marks the intermediate valid as well,
+-- without rebuilding anything.
+create function parted_reind6_f(int) returns int
+  immutable language sql as 'select $1 / 0';
+create table parted_reind6_tab (a int) partition by range (a);
+create table parted_reind6_tab_1 partition of parted_reind6_tab
+  for values from (1) to (10) partition by range (a);
+create table parted_reind6_tab_11 partition of parted_reind6_tab_1
+  for values from (1) to (5);
+insert into parted_reind6_tab_11 values (1);
+create index concurrently parted_reind6_idx_11
+  on parted_reind6_tab_11 (parted_reind6_f(a));
+ERROR:  division by zero
+create index parted_reind6_idx_1
+  on only parted_reind6_tab_1 (parted_reind6_f(a));
+create index parted_reind6_idx
+  on only parted_reind6_tab (parted_reind6_f(a));
+alter index parted_reind6_idx_1 attach partition parted_reind6_idx_11;
+alter index parted_reind6_idx attach partition parted_reind6_idx_1;
+create or replace function parted_reind6_f(int) returns int
+  immutable language sql as 'select $1';
+-- repairing the leaf on its own leaves both levels above it invalid
+reindex index parted_reind6_idx_11;
+NOTICE:  parent index "public.parted_reind6_idx_1" is still invalid
+DETAIL:  REINDEX does not modify indexes above the one named.
+HINT:  Use REINDEX (VALIDITY_ONLY) on that index to recheck it.
+select indexrelid::regclass, indisvalid
+  from pg_index
+  where indexrelid::regclass::text like 'parted_reind6%'
+  order by indexrelid::regclass::text collate "C";
+      indexrelid      | indisvalid 
+----------------------+------------
+ parted_reind6_idx    | f
+ parted_reind6_idx_1  | f
+ parted_reind6_idx_11 | t
+(3 rows)
+
+-- naming the top validates the intermediate and the top together
+reindex (validity_only) index parted_reind6_idx;
+select indexrelid::regclass, indisvalid
+  from pg_index
+  where indexrelid::regclass::text like 'parted_reind6%'
+  order by indexrelid::regclass::text collate "C";
+      indexrelid      | indisvalid 
+----------------------+------------
+ parted_reind6_idx    | t
+ parted_reind6_idx_1  | t
+ parted_reind6_idx_11 | t
+(3 rows)
+
+drop table parted_reind6_tab;
+drop function parted_reind6_f(int);
+-- If the index named cannot be validated, nothing is left marked valid: the
+-- error rolls back the intermediate levels the descent had already done.
+create function parted_reind7_f(int) returns int
+  immutable language sql as 'select $1 / 0';
+create table parted_reind7_tab (a int) partition by range (a);
+create table parted_reind7_tab_1 partition of parted_reind7_tab
+  for values from (1) to (10) partition by range (a);
+create table parted_reind7_tab_11 partition of parted_reind7_tab_1
+  for values from (1) to (5);
+-- a second partition of the top, which never acquires an index
+create table parted_reind7_tab_2 partition of parted_reind7_tab
+  for values from (10) to (20);
+insert into parted_reind7_tab_11 values (1);
+create index concurrently parted_reind7_idx_11
+  on parted_reind7_tab_11 (parted_reind7_f(a));
+ERROR:  division by zero
+create index parted_reind7_idx_1
+  on only parted_reind7_tab_1 (parted_reind7_f(a));
+create index parted_reind7_idx
+  on only parted_reind7_tab (parted_reind7_f(a));
+alter index parted_reind7_idx_1 attach partition parted_reind7_idx_11;
+alter index parted_reind7_idx attach partition parted_reind7_idx_1;
+create or replace function parted_reind7_f(int) returns int
+  immutable language sql as 'select $1';
+reindex index parted_reind7_idx_11;
+NOTICE:  parent index "public.parted_reind7_idx_1" is still invalid
+DETAIL:  REINDEX does not modify indexes above the one named.
+HINT:  Use REINDEX (VALIDITY_ONLY) on that index to recheck it.
+-- the intermediate could now be validated, but the top never can
+reindex (validity_only) index parted_reind7_idx;  -- errors
+ERROR:  index "public.parted_reind7_idx" could not be marked valid
+DETAIL:  Not every partition has a valid index attached to it.
+HINT:  Repair or attach the remaining partition indexes first; VALIDITY_ONLY does not rebuild them.
+-- so the intermediate must still be invalid
+select indexrelid::regclass, indisvalid
+  from pg_index
+  where indexrelid::regclass::text like 'parted_reind7%'
+  order by indexrelid::regclass::text collate "C";
+      indexrelid      | indisvalid 
+----------------------+------------
+ parted_reind7_idx    | f
+ parted_reind7_idx_1  | f
+ parted_reind7_idx_11 | t
+(3 rows)
+
+drop table parted_reind7_tab;
+drop function parted_reind7_f(int);
+-- Naming an intermediate index with VALIDITY_ONLY settles the levels below it
+-- and leaves the top invalid, so the notice names it.  It is reported whether
+-- or not this command is what made the index named valid.
+create function parted_reind8_f(int) returns int
+  immutable language sql as 'select $1 / 0';
+create table parted_reind8_tab (a int) partition by range (a);
+create table parted_reind8_tab_1 partition of parted_reind8_tab
+  for values from (1) to (10) partition by range (a);
+create table parted_reind8_tab_11 partition of parted_reind8_tab_1
+  for values from (1) to (5);
+insert into parted_reind8_tab_11 values (1);
+create index concurrently parted_reind8_idx_11
+  on parted_reind8_tab_11 (parted_reind8_f(a));
+ERROR:  division by zero
+create index parted_reind8_idx_1
+  on only parted_reind8_tab_1 (parted_reind8_f(a));
+create index parted_reind8_idx
+  on only parted_reind8_tab (parted_reind8_f(a));
+alter index parted_reind8_idx_1 attach partition parted_reind8_idx_11;
+alter index parted_reind8_idx attach partition parted_reind8_idx_1;
+create or replace function parted_reind8_f(int) returns int
+  immutable language sql as 'select $1';
+-- repairing the leaf reports the intermediate, which it does not touch
+reindex index parted_reind8_idx_11;
+NOTICE:  parent index "public.parted_reind8_idx_1" is still invalid
+DETAIL:  REINDEX does not modify indexes above the one named.
+HINT:  Use REINDEX (VALIDITY_ONLY) on that index to recheck it.
+-- the concurrent form reports it on the same terms
+reindex index concurrently parted_reind8_idx_11;
+NOTICE:  parent index "public.parted_reind8_idx_1" is still invalid
+DETAIL:  REINDEX does not modify indexes above the one named.
+HINT:  Use REINDEX (VALIDITY_ONLY) on that index to recheck it.
+reindex (validity_only) index parted_reind8_idx_1;  -- notice, top left invalid
+NOTICE:  parent index "public.parted_reind8_idx" is still invalid
+DETAIL:  REINDEX does not modify indexes above the one named.
+HINT:  Use REINDEX (VALIDITY_ONLY) on that index to recheck it.
+select indexrelid::regclass, indisvalid
+  from pg_index
+  where indexrelid::regclass::text like 'parted_reind8%'
+  order by indexrelid::regclass::text collate "C";
+      indexrelid      | indisvalid 
+----------------------+------------
+ parted_reind8_idx    | f
+ parted_reind8_idx_1  | t
+ parted_reind8_idx_11 | t
+(3 rows)
+
+-- again, now that it is already valid: the top is still worth reporting
+reindex (validity_only) index parted_reind8_idx_1;
+NOTICE:  parent index "public.parted_reind8_idx" is still invalid
+DETAIL:  REINDEX does not modify indexes above the one named.
+HINT:  Use REINDEX (VALIDITY_ONLY) on that index to recheck it.
+-- naming the top says nothing, having nothing above it
+reindex (validity_only) index parted_reind8_idx;
+select indexrelid::regclass, indisvalid
+  from pg_index
+  where indexrelid::regclass::text like 'parted_reind8%'
+  order by indexrelid::regclass::text collate "C";
+      indexrelid      | indisvalid 
+----------------------+------------
+ parted_reind8_idx    | t
+ parted_reind8_idx_1  | t
+ parted_reind8_idx_11 | t
+(3 rows)
+
+drop table parted_reind8_tab;
+drop function parted_reind8_f(int);
+-- VALIDITY_ONLY reports the same way, and its report identifies the level that
+-- is the reason, which the error on the index named does not.
+create function parted_reind10_f(int) returns int
+  immutable language sql as 'select $1 / 0';
+create table parted_reind10_tab (a int) partition by range (a);
+create table parted_reind10_tab_1 partition of parted_reind10_tab
+  for values from (1) to (10) partition by range (a);
+create table parted_reind10_tab_11 partition of parted_reind10_tab_1
+  for values from (1) to (5);
+insert into parted_reind10_tab_11 values (1);
+create index concurrently parted_reind10_idx_11
+  on parted_reind10_tab_11 (parted_reind10_f(a));
+ERROR:  division by zero
+create index parted_reind10_idx_1
+  on only parted_reind10_tab_1 (parted_reind10_f(a));
+create index parted_reind10_idx
+  on only parted_reind10_tab (parted_reind10_f(a));
+alter index parted_reind10_idx_1 attach partition parted_reind10_idx_11;
+alter index parted_reind10_idx attach partition parted_reind10_idx_1;
+\set VERBOSITY terse \\ -- suppress machine-dependent details
+-- the leaf is still invalid, so neither level above it can be validated
+reindex (validity_only, verbose) index parted_reind10_idx;  -- errors
+INFO:  index "public.parted_reind10_idx_1" could not be marked valid
+ERROR:  index "public.parted_reind10_idx" could not be marked valid
+create or replace function parted_reind10_f(int) returns int
+  immutable language sql as 'select $1';
+reindex index parted_reind10_idx_11;
+NOTICE:  parent index "public.parted_reind10_idx_1" is still invalid
+-- with the leaf repaired both levels go valid, and both are reported
+reindex (validity_only, verbose) index parted_reind10_idx;
+INFO:  index "public.parted_reind10_idx_1" was marked valid
+INFO:  index "public.parted_reind10_idx" was marked valid
+-- and asking again reports the index named, rather than saying nothing at all
+reindex (validity_only, verbose) index parted_reind10_idx;
+INFO:  index "public.parted_reind10_idx" is already valid
+\set VERBOSITY default
+drop table parted_reind10_tab;
+drop function parted_reind10_f(int);
+-- VALIDITY_ONLY rebuilds nothing, so CONCURRENTLY and TABLESPACE are both
+-- contradictory and rejected; for the same reason it is allowed inside a
+-- transaction block, which a partitioned REINDEX otherwise is not.
+create table parted_reind9_tab (a int) partition by range (a);
+create table parted_reind9_tab_1 partition of parted_reind9_tab
+  for values from (1) to (10);
+create index parted_reind9_idx on parted_reind9_tab (a);
+reindex (validity_only, concurrently) index parted_reind9_idx;  -- errors
+ERROR:  REINDEX option VALIDITY_ONLY cannot be used with CONCURRENTLY
+DETAIL:  VALIDITY_ONLY rebuilds nothing, so there is nothing to do concurrently.
+reindex (validity_only) index concurrently parted_reind9_idx;  -- errors, either spelling
+ERROR:  REINDEX option VALIDITY_ONLY cannot be used with CONCURRENTLY
+DETAIL:  VALIDITY_ONLY rebuilds nothing, so there is nothing to do concurrently.
+-- TABLESPACE moves index storage as part of a rebuild, so it is rejected for
+-- the same reason; the combination is refused before the name is looked up
+reindex (validity_only, tablespace no_such_tablespace)
+  index parted_reind9_idx;  -- errors
+ERROR:  REINDEX option VALIDITY_ONLY cannot be used with TABLESPACE
+DETAIL:  VALIDITY_ONLY rebuilds nothing, so there is no index storage to move.
+HINT:  Use ALTER TABLE ONLY ... SET TABLESPACE on the partitioned index instead.
+begin;
+reindex (validity_only) index parted_reind9_idx;
+commit;
+begin;
+reindex index parted_reind9_idx;  -- errors, rebuilding needs its own transaction
+ERROR:  REINDEX INDEX cannot run inside a transaction block
+CONTEXT:  while reindexing partitioned index "public.parted_reind9_idx"
+rollback;
+drop table parted_reind9_tab;
+-- VALIDITY_ONLY is accepted for REINDEX INDEX only, and only on a
+-- partitioned index: an index with storage has no validity to recheck.
+create table parted_reind4_tab (a int) partition by range (a);
+create table parted_reind4_tab_1 partition of parted_reind4_tab
+  for values from (1) to (10);
+create index parted_reind4_idx on parted_reind4_tab (a);
+reindex (validity_only) table parted_reind4_tab;  -- errors, wrong form
+ERROR:  REINDEX option VALIDITY_ONLY is not supported by this form of REINDEX
+HINT:  VALIDITY_ONLY may be used with REINDEX INDEX.
+reindex (validity_only) index parted_reind4_tab_1_a_idx;  -- errors, leaf index
+ERROR:  cannot use VALIDITY_ONLY on non-partitioned index "public.parted_reind4_tab_1_a_idx"
+create table parted_reind4_plain (a int);
+create index parted_reind4_plain_idx on parted_reind4_plain (a);
+reindex (validity_only) index parted_reind4_plain_idx;  -- errors, not partitioned
+ERROR:  cannot use VALIDITY_ONLY on non-partitioned index "public.parted_reind4_plain_idx"
+reindex (validity_only) index parted_reind4_idx;  -- ok
+drop table parted_reind4_tab, parted_reind4_plain;
 -- Check state of replica indexes when attaching a partition.
 begin;
 create table parted_replica_tab (id int not null) partition by range (id);

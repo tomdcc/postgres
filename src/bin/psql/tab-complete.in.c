@@ -5189,7 +5189,8 @@ match_previous_words(int pattern_id,
 		 * one word, so the above test is correct.
 		 */
 		if (ends_with(prev_wd, '(') || ends_with(prev_wd, ','))
-			COMPLETE_WITH("CONCURRENTLY", "TABLESPACE", "VERBOSE");
+			COMPLETE_WITH("CONCURRENTLY", "TABLESPACE", "VALIDITY_ONLY",
+						  "VERBOSE");
 		else if (TailMatches("TABLESPACE"))
 			COMPLETE_WITH_QUERY(Query_for_list_of_tablespaces);
 	}
