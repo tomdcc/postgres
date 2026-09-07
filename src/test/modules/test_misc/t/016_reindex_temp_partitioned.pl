@@ -38,6 +38,16 @@ $owner->query_safe(q(CREATE INDEX tt_idx ON ONLY tt (a);));
 $owner->query_safe(q(BEGIN;));
 $owner->query_safe(q(LOCK TABLE tt IN ACCESS EXCLUSIVE MODE;));
 
+# A permanent incomplete tree in the same database.  REINDEX DATABASE reports a
+# partitioned index it leaves invalid, so this one shows that the recheck ran
+# and reported what is in scope, while the temporary tree is neither rechecked
+# nor mentioned.
+$node->safe_psql(
+	'postgres', q(
+	CREATE TABLE pt (a int) PARTITION BY RANGE (a);
+	CREATE TABLE pt1 PARTITION OF pt FOR VALUES FROM (1) TO (10);
+	CREATE INDEX pt_idx ON ONLY pt (a);));
+
 # Bound the damage of a regression: without lock_timeout this would hang for as
 # long as the owning session held its transaction open.
 local $ENV{PGOPTIONS} = '-c lock_timeout=30s';
@@ -46,7 +56,12 @@ my ($result, $stdout, $stderr) =
   $node->psql('postgres', 'REINDEX DATABASE postgres;');
 
 is($result, 0, 'REINDEX DATABASE skips another session\'s temp index');
-is($stderr, '', 'REINDEX DATABASE reports no error');
+like(
+	$stderr,
+	qr/partitioned index "public\.pt_idx" remains invalid/,
+	'the permanent incomplete tree in scope is reported');
+unlike($stderr, qr/tt_idx/,
+	'the other session\'s temporary index is not mentioned');
 
 # The index was skipped, not rechecked, so it is as invalid as it was.
 is( $node->safe_psql(

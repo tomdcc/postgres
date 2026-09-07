@@ -1106,7 +1106,12 @@ select c.relname, n.nspname, i.indisvalid
        join pg_namespace n on n.oid = c.relnamespace
   where n.nspname like 'parted_reind_s%'
   order by c.relname collate "C";
--- the wholly-contained tree is restored; the parent in the other schema is not
+-- the parent's schema alone: its partition's index lives in the other schema
+-- and is not rebuilt, so the parent stays invalid, and is reported since it is
+-- in scope
+reindex schema parted_reind_sb;
+-- the wholly-contained tree is restored; the parent in the other schema is not,
+-- and is not reported either: it is out of scope
 reindex schema parted_reind_sa;
 select c.relname, n.nspname, i.indisvalid
   from pg_index i join pg_class c on c.oid = i.indexrelid
@@ -1122,6 +1127,64 @@ select c.relname, n.nspname, i.indisvalid
   order by c.relname collate "C";
 drop schema parted_reind_sa cascade;
 drop schema parted_reind_sb cascade;
+
+-- A partitioned index within the scope of the command that REINDEX leaves
+-- invalid is reported, naming the partition that keeps it so.  Only the index
+-- directly affected is reported: its parent is invalid for the same reason and
+-- would only repeat the news.
+create table parted_reind6_tab (a int) partition by range (a);
+create table parted_reind6_tab_1 partition of parted_reind6_tab
+  for values from (1) to (10) partition by range (a);
+create table parted_reind6_tab_11 partition of parted_reind6_tab_1
+  for values from (1) to (5);
+create table parted_reind6_tab_12 partition of parted_reind6_tab_1
+  for values from (5) to (10);
+create index parted_reind6_idx_11 on parted_reind6_tab_11 (a);
+create index parted_reind6_idx_1 on only parted_reind6_tab_1 (a);
+create index parted_reind6_idx on only parted_reind6_tab (a);
+alter index parted_reind6_idx_1 attach partition parted_reind6_idx_11;
+alter index parted_reind6_idx attach partition parted_reind6_idx_1;
+-- naming the top: one warning, for the intermediate index
+reindex index parted_reind6_idx;
+-- naming the top table: the same
+reindex table parted_reind6_tab;
+-- naming the intermediate: the same warning; its own parent is out of scope
+reindex index parted_reind6_idx_1;
+-- naming a leaf partition: no partitioned index is in scope, so nothing
+reindex table parted_reind6_tab_11;
+select indexrelid::regclass, indisvalid
+  from pg_index
+  where indexrelid::regclass::text like 'parted_reind6%'
+  order by indexrelid::regclass::text collate "C";
+drop table parted_reind6_tab;
+
+-- The concurrent forms skip an invalid leaf index and warn about that; the
+-- partitioned index above it then stays invalid and is reported as well,
+-- naming the leaf.  The non-concurrent form repairs both, silently.
+create function parted_reind7_f(int) returns int
+  immutable language sql as 'select $1 / 0';
+create table parted_reind7_tab (a int) partition by range (a);
+create table parted_reind7_tab_1 partition of parted_reind7_tab
+  for values from (1) to (10);
+insert into parted_reind7_tab_1 values (1);
+create index concurrently parted_reind7_idx_1
+  on parted_reind7_tab_1 (parted_reind7_f(a));
+create index parted_reind7_idx on only parted_reind7_tab (parted_reind7_f(a));
+alter index parted_reind7_idx attach partition parted_reind7_idx_1;
+create or replace function parted_reind7_f(int) returns int
+  immutable language sql as 'select $1';
+reindex table concurrently parted_reind7_tab;
+select indexrelid::regclass, indisvalid
+  from pg_index
+  where indexrelid::regclass::text like 'parted_reind7%'
+  order by indexrelid::regclass::text collate "C";
+reindex table parted_reind7_tab;
+select indexrelid::regclass, indisvalid
+  from pg_index
+  where indexrelid::regclass::text like 'parted_reind7%'
+  order by indexrelid::regclass::text collate "C";
+drop table parted_reind7_tab;
+drop function parted_reind7_f(int);
 
 -- Check state of replica indexes when attaching a partition.
 begin;
