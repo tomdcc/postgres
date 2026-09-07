@@ -353,6 +353,15 @@ REINDEX [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] { DA
   </para>
 
   <para>
+   A partitioned index within the scope of the command that remains invalid
+   after this recheck is reported with a <literal>WARNING</literal> naming the
+   partition that has no valid index attached.  If that partition's index is
+   itself a partitioned index within the scope, only the latter is reported.
+   An index above the object named is outside the scope and is neither
+   rechecked nor reported.
+  </para>
+
+  <para>
    When using the <literal>TABLESPACE</literal> clause with
    <command>REINDEX</command> on a partitioned index or table, only the
    tablespace references of the leaf partitions are updated. As partitioned

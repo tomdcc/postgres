@@ -120,6 +120,8 @@ static void ReindexMultipleTables(const ReindexStmt *stmt,
 static void reindex_error_callback(void *arg);
 static void ReindexPartitions(const ReindexStmt *stmt, Oid relid,
 							  const ReindexParams *params, bool isTopLevel);
+static void ReportInvalidPartitionedIndex(Relation partedIdx,
+										  Relation partedTbl, List *inscope);
 static void ReindexMultipleInternal(const ReindexStmt *stmt, const List *relids,
 									const ReindexParams *params);
 static bool ReindexRelationConcurrently(const ReindexStmt *stmt,
@@ -3625,6 +3627,39 @@ ReindexMultipleTables(const ReindexStmt *stmt, const ReindexParams *params)
 			}
 		}
 
+		/*
+		 * Whatever is still invalid now is going to stay that way, so report
+		 * it.  The locks taken above are still held.
+		 */
+		foreach_oid(idxoid, partedidxs)
+		{
+			Relation	partedTbl;
+			Relation	partedIdx;
+			Oid			tbloid;
+
+			if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(idxoid)))
+				continue;
+			if (get_index_isvalid(idxoid))
+				continue;
+			tbloid = IndexGetRelation(idxoid, true);
+			if (!OidIsValid(tbloid))
+				continue;
+			partedTbl = try_table_open(tbloid, NoLock);
+			if (partedTbl == NULL)
+				continue;
+			partedIdx = try_index_open(idxoid, NoLock);
+			if (partedIdx == NULL)
+			{
+				table_close(partedTbl, NoLock);
+				continue;
+			}
+
+			ReportInvalidPartitionedIndex(partedIdx, partedTbl, partedidxs);
+
+			index_close(partedIdx, NoLock);
+			table_close(partedTbl, NoLock);
+		}
+
 		PopActiveSnapshot();
 	}
 
@@ -3844,7 +3879,13 @@ ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *param
 				continue;
 			}
 
-			validatePartitionedIndex(partedIdx, partedTbl, false);
+			/*
+			 * Deepest first, so everything beneath this index has already
+			 * been settled: if it cannot be validated now, it will stay
+			 * invalid, and that is worth telling the user.
+			 */
+			if (!validatePartitionedIndex(partedIdx, partedTbl, false))
+				ReportInvalidPartitionedIndex(partedIdx, partedTbl, tovalidate);
 
 			index_close(partedIdx, NoLock);
 			table_close(partedTbl, NoLock);
@@ -3862,6 +3903,125 @@ ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *param
 	 * context!
 	 */
 	MemoryContextDelete(reindex_context);
+}
+
+/*
+ * ReportInvalidPartitionedIndex
+ *		Warn that REINDEX leaves a partitioned index invalid, and say why.
+ *
+ * A partitioned index within the scope of the command that is still invalid
+ * once the rebuilds and the validity recheck are done is one whose tree is
+ * incomplete, which REINDEX cannot repair.  Report it, naming the partition
+ * that keeps it so, since that is where the user has to go next.
+ *
+ * Only the index directly affected is reported.  If the offending partition's
+ * index is itself a partitioned index within the scope of this command, it
+ * has (or will have) its own warning naming the real cause, and this one
+ * stays quiet rather than repeating the news once per level.  A partitioned
+ * child outside the scope gets no warning of its own, so its parent speaks.
+ *
+ * The caller holds locks on both relations sufficient to keep the set of
+ * partitions and attached indexes stable.
+ */
+static void
+ReportInvalidPartitionedIndex(Relation partedIdx, Relation partedTbl,
+							  List *inscope)
+{
+	PartitionDesc partdesc;
+	List	   *children;
+	int			nchildren;
+	Oid		   *childidx;
+	Oid		   *childtbl;
+	bool	   *childvalid;
+	int			i = 0;
+
+	Assert(!partedIdx->rd_index->indisvalid);
+
+	/* Map each attached index to the partition it is on. */
+	children = find_inheritance_children(RelationGetRelid(partedIdx), NoLock);
+	nchildren = list_length(children);
+	childidx = palloc(nchildren * sizeof(Oid));
+	childtbl = palloc(nchildren * sizeof(Oid));
+	childvalid = palloc(nchildren * sizeof(bool));
+	foreach_oid(childoid, children)
+	{
+		HeapTuple	tup;
+		Form_pg_index indexForm;
+
+		tup = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(childoid));
+		if (!HeapTupleIsValid(tup))
+			elog(ERROR, "cache lookup failed for index %u", childoid);
+		indexForm = (Form_pg_index) GETSTRUCT(tup);
+		childidx[i] = childoid;
+		childtbl[i] = indexForm->indrelid;
+		childvalid[i] = indexForm->indisvalid;
+		i++;
+		ReleaseSysCache(tup);
+	}
+
+	/* Find the first partition without a valid attached index. */
+	partdesc = RelationGetPartitionDesc(partedTbl, true);
+	for (int p = 0; p < partdesc->nparts; p++)
+	{
+		Oid			partoid = partdesc->oids[p];
+		int			c;
+
+		for (c = 0; c < nchildren; c++)
+			if (childtbl[c] == partoid)
+				break;
+
+		if (c == nchildren)
+		{
+			char	   *partnsp = get_namespace_name(get_rel_namespace(partoid));
+			char	   *partname = get_rel_name(partoid);
+
+			if (partnsp == NULL || partname == NULL)
+				continue;		/* dropped concurrently; not our problem */
+
+			ereport(WARNING,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("partitioned index \"%s.%s\" remains invalid",
+							get_namespace_name(RelationGetNamespace(partedIdx)),
+							RelationGetRelationName(partedIdx)),
+					 errdetail("Partition \"%s.%s\" has no attached index.",
+							   partnsp, partname),
+					 errhint("Create an index on the partition and attach it with ALTER INDEX ... ATTACH PARTITION.")));
+			break;
+		}
+
+		if (!childvalid[c])
+		{
+			char	   *idxnsp;
+			char	   *idxname;
+
+			/* an invalid partitioned child in scope reports itself */
+			if (get_rel_relkind(childidx[c]) == RELKIND_PARTITIONED_INDEX &&
+				list_member_oid(inscope, childidx[c]))
+				continue;
+
+			idxnsp = get_namespace_name(get_rel_namespace(childidx[c]));
+			idxname = get_rel_name(childidx[c]);
+			if (idxnsp == NULL || idxname == NULL)
+				continue;
+
+			ereport(WARNING,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("partitioned index \"%s.%s\" remains invalid",
+							get_namespace_name(RelationGetNamespace(partedIdx)),
+							RelationGetRelationName(partedIdx)),
+					 errdetail("Index \"%s.%s\" on partition \"%s.%s\" is invalid.",
+							   idxnsp, idxname,
+							   get_namespace_name(get_rel_namespace(partdesc->oids[p])),
+							   get_rel_name(partdesc->oids[p])),
+					 errhint("Use REINDEX INDEX on the partitioned index.")));
+			break;
+		}
+	}
+
+	pfree(childidx);
+	pfree(childtbl);
+	pfree(childvalid);
+	list_free(children);
 }
 
 /*
