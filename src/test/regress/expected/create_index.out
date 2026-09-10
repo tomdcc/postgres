@@ -3887,6 +3887,48 @@ SELECT relname, relpersistence FROM pg_class
 (3 rows)
 
 DROP TABLE nodata_alter;
+-- A no-data index holds no entries and is not maintained, so an update cannot
+-- make it inconsistent and it must not cost HOT updates on its columns.  Since
+-- deferring the build is often meant to keep a busy period cheap, blocking HOT
+-- would charge much of the price the deferral was avoiding, and would buy
+-- nothing: there is nothing in the index to keep in step with the heap.
+CREATE TABLE nodata_hot (a int, b int) WITH (fillfactor = 50);
+INSERT INTO nodata_hot SELECT g, g FROM generate_series(1, 200) g;
+VACUUM nodata_hot;
+CREATE INDEX nodata_hot_a ON nodata_hot (a) WITH NO DATA;
+SELECT pg_stat_get_tuples_hot_updated('nodata_hot'::regclass) AS hot_before \gset
+UPDATE nodata_hot SET a = a + 1;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_stat_get_tuples_hot_updated('nodata_hot'::regclass) - :hot_before
+         AS hot_while_deferred;
+ hot_while_deferred 
+--------------------
+                200
+(1 row)
+
+-- once populated it blocks HOT, exactly as an ordinary index on that column
+REINDEX INDEX nodata_hot_a;
+SELECT pg_stat_get_tuples_hot_updated('nodata_hot'::regclass) AS hot_before \gset
+UPDATE nodata_hot SET a = a + 1;
+SELECT pg_stat_force_next_flush();
+ pg_stat_force_next_flush 
+--------------------------
+ 
+(1 row)
+
+SELECT pg_stat_get_tuples_hot_updated('nodata_hot'::regclass) - :hot_before
+         AS hot_once_populated;
+ hot_once_populated 
+--------------------
+                  0
+(1 row)
+
+DROP TABLE nodata_hot;
 -- ALTER TABLE ... ATTACH PARTITION adopts a matching no-data index when the
 -- index it would attach to is itself already invalid: nothing is demoted, and
 -- the build the user arranged to avoid does not happen.

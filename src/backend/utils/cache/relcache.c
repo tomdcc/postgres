@@ -5384,6 +5384,17 @@ restart:
 	 * included in HOT-safety decisions (see README.HOT).  If a DROP INDEX
 	 * CONCURRENTLY is far enough along that we should ignore the index, it
 	 * won't be returned at all by RelationGetIndexList.
+	 *
+	 * An index created WITH NO DATA is the one exception, and is skipped
+	 * entirely.  It holds no entries, nothing maintains it, and while it is
+	 * unpopulated it can neither be referenced by a foreign key nor serve as
+	 * the primary key or the replica identity, so it belongs in none of these
+	 * bitmaps.  Unlike an index whose concurrent build is under way, it will
+	 * not acquire entries behind our back: only a REINDEX naming it populates
+	 * it, and that either takes a lock excluding the updates these bitmaps
+	 * govern or, when CONCURRENTLY, builds a separate index that is accounted
+	 * for on its own.  reindex_index() invalidates this relcache entry in the
+	 * same update that clears the flag.
 	 */
 	uindexattrs = NULL;
 	pkindexattrs = NULL;
@@ -5405,6 +5416,13 @@ restart:
 		Bitmapset **attrs;
 
 		indexDesc = index_open(indexOid, AccessShareLock);
+
+		/* Skip an index created WITH NO DATA; see above. */
+		if (indexDesc->rd_index->indisnodata)
+		{
+			index_close(indexDesc, AccessShareLock);
+			continue;
+		}
 
 		/*
 		 * Extract index expressions and index predicate.  Note: Don't use
