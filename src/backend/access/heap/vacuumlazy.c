@@ -255,6 +255,8 @@ typedef struct LVRelState
 	Relation	rel;
 	Relation   *indrels;
 	int			nindexes;
+	/* Whether the relation has any indexes, vacuumable or not */
+	bool		hasindex;
 
 	/* Buffer access strategy and parallel vacuum state */
 	BufferAccessStrategy bstrategy;
@@ -698,7 +700,7 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
 	/* Set up high level stuff about rel and its indexes */
 	vacrel->rel = rel;
 	vac_open_indexes(vacrel->rel, RowExclusiveLock, &vacrel->nindexes,
-					 &vacrel->indrels);
+					 &vacrel->indrels, &vacrel->hasindex);
 	vacrel->bstrategy = bstrategy;
 	if (instrument && vacrel->nindexes > 0)
 	{
@@ -970,7 +972,7 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
 	 */
 	vac_update_relstats(rel, new_rel_pages, vacrel->new_live_tuples,
 						new_rel_allvisible, new_rel_allfrozen,
-						vacrel->nindexes > 0,
+						vacrel->hasindex,
 						vacrel->NewRelfrozenXid, vacrel->NewRelminMxid,
 						&frozenxid_updated, &minmulti_updated, false);
 

@@ -1520,3 +1520,506 @@ RESET ROLE;
 REVOKE USAGE ON SCHEMA pg_toast FROM regress_reindexuser;
 DROP ROLE regress_reindexuser;
 DROP SCHEMA schema_to_reindex CASCADE;
+
+--
+-- CREATE INDEX ... WITH NO DATA
+--
+
+RESET search_path;
+
+CREATE TABLE nodata_tab (a int, b text);
+INSERT INTO nodata_tab SELECT g, g::text FROM generate_series(1, 1000) g;
+
+CREATE INDEX nodata_idx ON nodata_tab (a) WITH NO DATA;
+
+-- live, but neither ready nor valid, and flagged as deliberately empty
+SELECT indisnodata, indisvalid, indisready, indislive
+  FROM pg_index WHERE indexrelid = 'nodata_idx'::regclass;
+
+-- no build happened, so no storage was consumed
+SELECT pg_relation_size('nodata_idx');
+
+-- the planner ignores it, even when told not to seqscan
+EXPLAIN (COSTS OFF) SELECT * FROM nodata_tab WHERE a = 42;
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT * FROM nodata_tab WHERE a = 42;
+RESET enable_seqscan;
+
+-- DML during the gap succeeds and does not maintain the index
+INSERT INTO nodata_tab VALUES (1001, '1001');
+UPDATE nodata_tab SET a = -1 WHERE a = 500;
+DELETE FROM nodata_tab WHERE a = 600;
+SELECT pg_relation_size('nodata_idx');
+
+-- a unique index WITH NO DATA enforces nothing at all: duplicates are admitted
+CREATE UNIQUE INDEX nodata_uidx ON nodata_tab (b) WITH NO DATA;
+INSERT INTO nodata_tab VALUES (2, '2');
+SELECT count(*) FROM nodata_tab WHERE b = '2';
+
+-- so ON CONFLICT cannot infer it ...
+INSERT INTO nodata_tab VALUES (3, '3') ON CONFLICT (b) DO NOTHING;
+
+-- ... and it cannot be promoted to a constraint (pre-existing indisvalid guard)
+ALTER TABLE nodata_tab ADD CONSTRAINT nodata_b_key UNIQUE USING INDEX nodata_uidx;
+
+-- the clause combines with the rest of CREATE INDEX's tail
+CREATE INDEX nodata_partial_idx ON nodata_tab USING btree (a)
+    WITH (fillfactor = 70) WHERE a > 5 WITH NO DATA;
+SELECT indisnodata FROM pg_index
+  WHERE indexrelid = 'nodata_partial_idx'::regclass;
+
+-- the scanner's WITH -> WITH_LA_NO conversion must not disturb DATA or NO used
+-- as identifiers, including alongside the clause itself
+CREATE TABLE data (no int);
+CREATE INDEX data_idx ON data USING btree (no)
+    WITH (fillfactor = 70) WITH NO DATA;
+SELECT indisnodata FROM pg_index WHERE indexrelid = 'data_idx'::regclass;
+WITH data AS (SELECT 1 AS no) SELECT no FROM data;
+WITH no AS (SELECT 1 AS data) SELECT data FROM no;
+DROP TABLE data;
+
+-- pg_get_indexdef reports the state, with the clause last as the grammar
+-- puts it
+SELECT pg_get_indexdef('nodata_partial_idx'::regclass);
+
+-- CONCURRENTLY and WITH NO DATA are contradictory
+CREATE INDEX CONCURRENTLY nodata_conc_idx ON nodata_tab (a) WITH NO DATA;
+-- likewise on a temporary table, where CONCURRENTLY is silently downgraded
+CREATE TEMP TABLE nodata_temp (a int);
+CREATE INDEX CONCURRENTLY nodata_temp_idx ON nodata_temp (a) WITH NO DATA;
+DROP TABLE nodata_temp;
+
+-- accepted on a partitioned table, where it defers the build of every
+-- partition's index.  The partitioned indexes are marked too, though they have
+-- no storage to leave unbuilt: there the flag records that the tree was
+-- declared deferred, which is what a partition arriving later consults.  They
+-- are invalid until their partitions' indexes are populated, as any
+-- partitioned index is.
+CREATE TABLE nodata_part (a int) PARTITION BY RANGE (a);
+CREATE TABLE nodata_part_1 PARTITION OF nodata_part
+  FOR VALUES FROM (1) TO (10) PARTITION BY RANGE (a);
+CREATE TABLE nodata_part_11 PARTITION OF nodata_part_1 FOR VALUES FROM (1) TO (10);
+CREATE TABLE nodata_part_2 PARTITION OF nodata_part FOR VALUES FROM (10) TO (20);
+INSERT INTO nodata_part SELECT generate_series(1, 19);
+CREATE INDEX nodata_part_idx ON nodata_part (a) WITH NO DATA;
+SELECT c.relname, c.relkind, i.indisnodata, i.indisvalid,
+       pg_relation_size(i.indexrelid) AS size
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid IN ('nodata_part'::regclass, 'nodata_part_1'::regclass,
+                       'nodata_part_11'::regclass, 'nodata_part_2'::regclass)
+  ORDER BY 1;
+-- naming the partitioned index populates every partition's index, and ends the
+-- deferred state at every level: naming it is the explicit conversion the
+-- clause waits for.  Validity is a separate question, recomputed only by the
+-- commands that recompute it for any other partitioned index.
+REINDEX INDEX nodata_part_idx;
+SELECT c.relname, c.relkind, i.indisnodata, i.indisvalid
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid IN ('nodata_part'::regclass, 'nodata_part_1'::regclass,
+                       'nodata_part_11'::regclass, 'nodata_part_2'::regclass)
+  ORDER BY 1;
+DROP TABLE nodata_part;
+
+-- A partition arriving under a deferred index inherits the state rather than
+-- being built, whether it is attached or created in place.  The partitioned
+-- index carries indisnodata for exactly this purpose: it has no storage of its
+-- own, so the flag records that the tree was declared deferred.
+CREATE TABLE nodata_inh (a int) PARTITION BY RANGE (a);
+CREATE TABLE nodata_inh_0 PARTITION OF nodata_inh FOR VALUES FROM (0) TO (10);
+CREATE INDEX nodata_inh_idx ON nodata_inh (a) WITH NO DATA;
+-- attached, with no index of its own
+CREATE TABLE nodata_inh_1 (a int);
+INSERT INTO nodata_inh_1 SELECT generate_series(10, 19);
+ALTER TABLE nodata_inh ATTACH PARTITION nodata_inh_1 FOR VALUES FROM (10) TO (20);
+-- created in place
+CREATE TABLE nodata_inh_2 PARTITION OF nodata_inh FOR VALUES FROM (20) TO (30);
+SELECT c.relname, c.relkind, i.indisnodata, i.indisvalid,
+       pg_relation_size(i.indexrelid) AS size
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid IN ('nodata_inh'::regclass, 'nodata_inh_0'::regclass,
+                       'nodata_inh_1'::regclass, 'nodata_inh_2'::regclass)
+  ORDER BY 1;
+-- the definition reports it, as for any other no-data index
+SELECT pg_get_indexdef('nodata_inh_idx'::regclass);
+-- a REINDEX naming the index clears the flag at every level; validity is a
+-- separate question, recomputed here by the ATTACH that follows
+REINDEX INDEX nodata_inh_idx;
+ALTER INDEX nodata_inh_idx ATTACH PARTITION nodata_inh_0_a_idx;
+SELECT c.relname, i.indisnodata, i.indisvalid
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid = 'nodata_inh'::regclass;
+SELECT pg_get_indexdef('nodata_inh_idx'::regclass);
+-- a partition attached afterwards is built, the tree no longer being deferred
+CREATE TABLE nodata_inh_3 (a int);
+ALTER TABLE nodata_inh ATTACH PARTITION nodata_inh_3 FOR VALUES FROM (30) TO (40);
+SELECT c.relname, i.indisnodata, i.indisvalid
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid = 'nodata_inh_3'::regclass;
+DROP TABLE nodata_inh;
+
+-- Nothing ends the deferred state as a side effect.  Attaching the last
+-- partition's index makes every partition valid, which would otherwise
+-- validate the tree and clear the flag -- leaving whether a tree stayed
+-- deferred to depend on the order partitions arrived in, and a tree restored
+-- from a dump differing from the one dumped, since pg_dump attaches the
+-- partition indexes after creating the parent.
+CREATE TABLE nodata_keep (a int) PARTITION BY RANGE (a);
+CREATE TABLE nodata_keep_0 PARTITION OF nodata_keep FOR VALUES FROM (0) TO (10);
+INSERT INTO nodata_keep SELECT generate_series(0, 9);
+CREATE INDEX nodata_keep_idx ON nodata_keep (a) WITH NO DATA;
+REINDEX INDEX nodata_keep_0_a_idx;
+ALTER INDEX nodata_keep_idx ATTACH PARTITION nodata_keep_0_a_idx;
+SELECT c.relname, i.indisnodata, i.indisvalid
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid = 'nodata_keep'::regclass;
+-- so a partition arriving now still inherits the deferral
+CREATE TABLE nodata_keep_1 (a int);
+INSERT INTO nodata_keep_1 SELECT generate_series(10, 19);
+ALTER TABLE nodata_keep ATTACH PARTITION nodata_keep_1 FOR VALUES FROM (10) TO (20);
+SELECT c.relname, i.indisnodata, i.indisvalid,
+       pg_relation_size(i.indexrelid) AS size
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid = 'nodata_keep_1'::regclass;
+-- naming the index is what ends it; validity is then recomputed as usual
+REINDEX INDEX nodata_keep_idx;
+SELECT c.relname, i.indisnodata, i.indisvalid
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid = 'nodata_keep'::regclass;
+ALTER INDEX nodata_keep_idx ATTACH PARTITION nodata_keep_0_a_idx;
+SELECT c.relname, i.indisnodata, i.indisvalid
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid = 'nodata_keep'::regclass;
+DROP TABLE nodata_keep;
+
+-- ON ONLY defers the partitioned index alone, creating no partition indexes;
+-- this is the form pg_dump emits, since a partitioned index is always dumped
+-- ON ONLY with the partitions attached afterwards
+CREATE TABLE nodata_only (a int) PARTITION BY RANGE (a);
+CREATE TABLE nodata_only_0 PARTITION OF nodata_only FOR VALUES FROM (0) TO (10);
+CREATE INDEX nodata_only_idx ON ONLY nodata_only (a) WITH NO DATA;
+SELECT c.relname, i.indisnodata, i.indisvalid
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid IN ('nodata_only'::regclass, 'nodata_only_0'::regclass)
+  ORDER BY 1;
+DROP TABLE nodata_only;
+
+-- Recursion attaches an equivalent existing index where it finds one rather
+-- than creating another, so a tree whose partitions are all already indexed
+-- has no build to defer at this moment.  The index is still marked, and still
+-- awaits an explicit validation: the clause declares what the tree is for from
+-- here on, which is not answerable from what happens to be attached when the
+-- command runs.  Deciding it was a no-op would make the state depend on that
+-- accident of timing, and would grant a validity the user did not ask for.
+CREATE TABLE nodata_match (a int) PARTITION BY RANGE (a);
+CREATE TABLE nodata_match_0 PARTITION OF nodata_match FOR VALUES FROM (0) TO (10);
+CREATE INDEX nodata_match_0_a ON nodata_match_0 (a);
+CREATE INDEX nodata_match_idx ON nodata_match (a) WITH NO DATA;
+SELECT c.relname, i.indisnodata, i.indisvalid
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid IN ('nodata_match'::regclass, 'nodata_match_0'::regclass)
+  ORDER BY 1;
+-- the partition keeps the index it arrived with, untouched
+SELECT pg_relation_size('nodata_match_0_a'::regclass) > 0 AS populated;
+-- and a partition attached meanwhile inherits the deferral, as under any other
+-- index still awaiting one
+CREATE TABLE nodata_match_1 (a int);
+INSERT INTO nodata_match_1 SELECT generate_series(10, 19);
+ALTER TABLE nodata_match ATTACH PARTITION nodata_match_1 FOR VALUES FROM (10) TO (20);
+SELECT c.relname, i.indisnodata, i.indisvalid,
+       pg_relation_size(i.indexrelid) AS size
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid = 'nodata_match_1'::regclass;
+DROP TABLE nodata_match;
+
+-- rejected on system catalogs, whose scans do not consult indisvalid
+SET allow_system_table_mods = on;
+CREATE INDEX ON pg_class (relname) WITH NO DATA;
+RESET allow_system_table_mods;
+
+-- WITH DATA is not accepted here, unlike CREATE TABLE AS (see gram.y)
+CREATE INDEX nodata_withdata_idx ON nodata_tab (a) WITH DATA;
+
+-- Only a command that names a no-data index populates it.  Table rewrites
+-- give it fresh, correctly-persisted storage and stop there, silently.
+CREATE INDEX nodata_ok_idx ON nodata_tab (a);
+VACUUM FULL nodata_tab;
+CLUSTER nodata_tab USING nodata_ok_idx;
+TRUNCATE nodata_tab;
+SELECT indexrelid::regclass, indisnodata, indisvalid, indisready
+  FROM pg_index WHERE indrelid = 'nodata_tab'::regclass ORDER BY 1;
+
+-- but a bulk REINDEX says so, since the user did ask for a reindex
+REINDEX TABLE nodata_tab;
+REINDEX TABLE CONCURRENTLY nodata_tab;
+SELECT indexrelid::regclass, indisnodata FROM pg_index
+  WHERE indrelid = 'nodata_tab'::regclass ORDER BY 1;
+
+-- REINDEX SCHEMA reaches reindex_relation() by a different route, so check it
+-- warns and skips too.  (REINDEX DATABASE shares that route, but reindexing
+-- the whole regression database is not something to do from here.)
+CREATE SCHEMA nodata_schema;
+CREATE TABLE nodata_schema.tab (a int);
+INSERT INTO nodata_schema.tab SELECT generate_series(1, 100);
+CREATE INDEX tab_nodata ON nodata_schema.tab (a) WITH NO DATA;
+REINDEX SCHEMA nodata_schema;
+REINDEX SCHEMA CONCURRENTLY nodata_schema;
+SELECT indexrelid::regclass, indisnodata, indisvalid, indisready
+  FROM pg_index WHERE indrelid = 'nodata_schema.tab'::regclass;
+DROP SCHEMA nodata_schema CASCADE;
+
+-- ALTER TABLE ... ALTER COLUMN TYPE must not complete it, on either branch.
+-- varchar(10) -> varchar(20) reuses the storage; int -> bigint rewrites.
+CREATE TABLE nodata_alter (a int, b varchar(10));
+CREATE INDEX nodata_alter_a ON nodata_alter (a) WITH NO DATA;
+CREATE INDEX nodata_alter_b ON nodata_alter (b) WITH NO DATA;
+ALTER TABLE nodata_alter ALTER COLUMN b TYPE varchar(20);
+SELECT indexrelid::regclass, indisnodata, indisvalid, indisready
+  FROM pg_index WHERE indrelid = 'nodata_alter'::regclass ORDER BY 1;
+ALTER TABLE nodata_alter ALTER COLUMN a TYPE bigint;
+SELECT indexrelid::regclass, indisnodata, indisvalid, indisready,
+       pg_relation_size(indexrelid) AS size
+  FROM pg_index WHERE indrelid = 'nodata_alter'::regclass ORDER BY 1;
+
+-- A rewrite rebuilds every index on the table, not just those on the column
+-- being altered, so a no-data index has to survive one it has nothing to do
+-- with.  The ordinary index alongside it is what shows the rewrite happened.
+CREATE TABLE nodata_unrel (a int, b text, c int);
+CREATE INDEX nodata_unrel_a ON nodata_unrel (a) WITH NO DATA;
+CREATE INDEX nodata_unrel_c ON nodata_unrel (c);
+ALTER TABLE nodata_unrel ALTER COLUMN b TYPE varchar(100);
+SELECT indexrelid::regclass, indisnodata, indisvalid, indisready,
+       pg_relation_size(indexrelid) AS size
+  FROM pg_index WHERE indrelid = 'nodata_unrel'::regclass ORDER BY 1;
+DROP TABLE nodata_unrel;
+
+-- index persistence must still track the heap's across SET UNLOGGED/LOGGED
+ALTER TABLE nodata_alter SET UNLOGGED;
+SELECT relname, relpersistence FROM pg_class
+  WHERE relname LIKE 'nodata_alter%' ORDER BY 1;
+ALTER TABLE nodata_alter SET LOGGED;
+SELECT relname, relpersistence FROM pg_class
+  WHERE relname LIKE 'nodata_alter%' ORDER BY 1;
+DROP TABLE nodata_alter;
+
+-- A no-data index holds no entries and is not maintained, so an update cannot
+-- make it inconsistent and it must not cost HOT updates on its columns.  Since
+-- deferring the build is often meant to keep a busy period cheap, blocking HOT
+-- would charge much of the price the deferral was avoiding, and would buy
+-- nothing: there is nothing in the index to keep in step with the heap.
+CREATE TABLE nodata_hot (a int, b int) WITH (fillfactor = 50);
+INSERT INTO nodata_hot SELECT g, g FROM generate_series(1, 200) g;
+VACUUM nodata_hot;
+CREATE INDEX nodata_hot_a ON nodata_hot (a) WITH NO DATA;
+SELECT pg_stat_get_tuples_hot_updated('nodata_hot'::regclass) AS hot_before \gset
+UPDATE nodata_hot SET a = a + 1;
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_get_tuples_hot_updated('nodata_hot'::regclass) - :hot_before
+         AS hot_while_deferred;
+-- once populated it blocks HOT, exactly as an ordinary index on that column
+REINDEX INDEX nodata_hot_a;
+SELECT pg_stat_get_tuples_hot_updated('nodata_hot'::regclass) AS hot_before \gset
+UPDATE nodata_hot SET a = a + 1;
+SELECT pg_stat_force_next_flush();
+SELECT pg_stat_get_tuples_hot_updated('nodata_hot'::regclass) - :hot_before
+         AS hot_once_populated;
+DROP TABLE nodata_hot;
+
+-- ALTER TABLE ... ATTACH PARTITION adopts a matching no-data index when the
+-- index it would attach to is itself already invalid: nothing is demoted, and
+-- the build the user arranged to avoid does not happen.
+CREATE TABLE nodata_parted (a int) PARTITION BY RANGE (a);
+CREATE TABLE nodata_part0 PARTITION OF nodata_parted FOR VALUES FROM (0) TO (100);
+CREATE INDEX nodata_parted_idx ON ONLY nodata_parted (a);
+CREATE TABLE nodata_part1 (a int);
+CREATE INDEX nodata_part1_idx ON nodata_part1 (a) WITH NO DATA;
+ALTER TABLE nodata_parted ATTACH PARTITION nodata_part1 FOR VALUES FROM (100) TO (200);
+SELECT c.relname, i.indisnodata, i.indisvalid, c.relispartition,
+       pg_relation_size(i.indexrelid) AS size
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid IN ('nodata_parted'::regclass, 'nodata_part0'::regclass,
+                       'nodata_part1'::regclass) ORDER BY 1;
+DROP TABLE nodata_parted;
+
+-- but not when that index is valid, since attaching would invalidate it and
+-- building a duplicate would perform the very build being deferred
+CREATE TABLE nodata_parted (a int) PARTITION BY RANGE (a);
+CREATE TABLE nodata_part0 PARTITION OF nodata_parted FOR VALUES FROM (0) TO (100);
+CREATE INDEX nodata_parted_idx ON nodata_parted (a);
+CREATE TABLE nodata_part1 (a int);
+CREATE INDEX nodata_part1_idx ON nodata_part1 (a) WITH NO DATA;
+ALTER TABLE nodata_parted ATTACH PARTITION nodata_part1 FOR VALUES FROM (100) TO (200);
+-- populating it resolves the matter
+REINDEX INDEX nodata_part1_idx;
+ALTER TABLE nodata_parted ATTACH PARTITION nodata_part1 FOR VALUES FROM (100) TO (200);
+SELECT c.relname, i.indisnodata, i.indisvalid, c.relispartition
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid IN ('nodata_parted'::regclass, 'nodata_part0'::regclass,
+                       'nodata_part1'::regclass) ORDER BY 1;
+DROP TABLE nodata_parted;
+
+-- a no-data index that does not match the parent index is not evidence of
+-- anything, and does not stand in the way
+CREATE TABLE nodata_parted (a int, b int) PARTITION BY RANGE (a);
+CREATE TABLE nodata_part0 PARTITION OF nodata_parted FOR VALUES FROM (0) TO (100);
+CREATE INDEX nodata_parted_idx ON nodata_parted (a);
+CREATE TABLE nodata_part1 (a int, b int);
+CREATE INDEX nodata_part1_other ON nodata_part1 (b) WITH NO DATA;
+ALTER TABLE nodata_parted ATTACH PARTITION nodata_part1 FOR VALUES FROM (100) TO (200);
+SELECT c.relname, i.indisnodata, i.indisvalid, c.relispartition
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE i.indrelid IN ('nodata_parted'::regclass, 'nodata_part0'::regclass,
+                       'nodata_part1'::regclass) ORDER BY 1;
+DROP TABLE nodata_parted;
+
+-- ALTER INDEX ... ATTACH PARTITION does allow it, leaving the parent invalid
+CREATE TABLE nodata_parted2 (a int) PARTITION BY RANGE (a);
+CREATE TABLE nodata_part2 PARTITION OF nodata_parted2 FOR VALUES FROM (0) TO (100);
+CREATE INDEX nodata_part2_idx ON nodata_part2 (a) WITH NO DATA;
+CREATE INDEX nodata_parted2_idx ON ONLY nodata_parted2 (a);
+ALTER INDEX nodata_parted2_idx ATTACH PARTITION nodata_part2_idx;
+SELECT c.relname, i.indisnodata, i.indisvalid
+  FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE c.relname IN ('nodata_parted2_idx', 'nodata_part2_idx') ORDER BY 1;
+DROP TABLE nodata_parted2;
+
+-- A REINDEX naming the index is how a no-data index is meant to be populated.
+CREATE TABLE nodata_done (a int, b text);
+INSERT INTO nodata_done SELECT g, g::text FROM generate_series(1, 1000) g;
+CREATE INDEX nodata_done_plain ON nodata_done (a) WITH NO DATA;
+CREATE INDEX nodata_done_conc ON nodata_done (b) WITH NO DATA;
+REINDEX INDEX nodata_done_plain;
+REINDEX INDEX CONCURRENTLY nodata_done_conc;
+SELECT indexrelid::regclass, indisnodata, indisvalid, indisready
+  FROM pg_index WHERE indrelid = 'nodata_done'::regclass ORDER BY 1;
+-- the definition stops reporting the state along with the catalog flag
+SELECT pg_get_indexdef('nodata_done_plain'::regclass);
+-- and the planner now uses it
+SET enable_seqscan = off;
+EXPLAIN (COSTS OFF) SELECT * FROM nodata_done WHERE a = 42;
+RESET enable_seqscan;
+
+-- The governing principle: once populated, an index created WITH NO DATA must
+-- be indistinguishable in pg_index from one created normally.  Compare every
+-- column except the two OIDs, which necessarily differ.
+CREATE TABLE nodata_same1 (a int, b text);
+CREATE TABLE nodata_same2 (a int, b text);
+CREATE UNIQUE INDEX nodata_same1_idx ON nodata_same1 (a) INCLUDE (b);
+CREATE UNIQUE INDEX nodata_same2_idx ON nodata_same2 (a) INCLUDE (b) WITH NO DATA;
+REINDEX INDEX nodata_same2_idx;
+SELECT (SELECT ROW(indnatts, indnkeyatts, indisunique, indnullsnotdistinct,
+                   indisprimary, indisexclusion, indimmediate, indisclustered,
+                   indisvalid, indcheckxmin, indisready, indislive,
+                   indisreplident, indisnodata, indkey::text,
+                   indcollation::text, indclass::text, indoption::text,
+                   indexprs::text, indpred::text)
+          FROM pg_index WHERE indexrelid = 'nodata_same1_idx'::regclass)
+     = (SELECT ROW(indnatts, indnkeyatts, indisunique, indnullsnotdistinct,
+                   indisprimary, indisexclusion, indimmediate, indisclustered,
+                   indisvalid, indcheckxmin, indisready, indislive,
+                   indisreplident, indisnodata, indkey::text,
+                   indcollation::text, indclass::text, indoption::text,
+                   indexprs::text, indpred::text)
+          FROM pg_index WHERE indexrelid = 'nodata_same2_idx'::regclass)
+    AS pg_index_rows_identical;
+DROP TABLE nodata_same1, nodata_same2;
+
+-- A duplicate admitted during the gap makes the completing REINDEX fail
+-- loudly; the index stays no data, so the failure is retryable and nothing is
+-- silently corrupted.
+CREATE TABLE nodata_dup (a int);
+INSERT INTO nodata_dup VALUES (1), (1);
+CREATE UNIQUE INDEX nodata_dup_idx ON nodata_dup (a) WITH NO DATA;
+REINDEX INDEX nodata_dup_idx;
+SELECT indisnodata, indisvalid, indisready FROM pg_index
+  WHERE indexrelid = 'nodata_dup_idx'::regclass;
+DELETE FROM nodata_dup WHERE ctid = (SELECT max(ctid) FROM nodata_dup);
+REINDEX INDEX nodata_dup_idx;
+SELECT indisnodata, indisvalid, indisready FROM pg_index
+  WHERE indexrelid = 'nodata_dup_idx'::regclass;
+DROP TABLE nodata_dup;
+
+-- REINDEX INDEX on a partitioned index fans out to the leaves and populates
+-- them.  This guards the placement of the reindex_relation() skip: naming a
+-- partitioned index names its leaves.
+CREATE TABLE nodata_fan (a int) PARTITION BY RANGE (a);
+CREATE TABLE nodata_fan1 PARTITION OF nodata_fan FOR VALUES FROM (0) TO (100);
+INSERT INTO nodata_fan SELECT generate_series(0, 99);
+CREATE INDEX nodata_fan1_idx ON nodata_fan1 (a) WITH NO DATA;
+CREATE INDEX nodata_fan_idx ON ONLY nodata_fan (a);
+ALTER INDEX nodata_fan_idx ATTACH PARTITION nodata_fan1_idx;
+SELECT c.relname, i.indisnodata, i.indisvalid FROM pg_index i
+  JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE c.relname IN ('nodata_fan_idx', 'nodata_fan1_idx') ORDER BY 1;
+-- The leaf is populated, but the parent stays invalid: nothing re-counts valid
+-- children after a REINDEX.  Re-issuing ALTER INDEX ... ATTACH PARTITION on the
+-- already-attached child is the documented way to re-run that check.
+REINDEX INDEX nodata_fan_idx;
+SELECT c.relname, i.indisnodata, i.indisvalid FROM pg_index i
+  JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE c.relname IN ('nodata_fan_idx', 'nodata_fan1_idx') ORDER BY 1;
+ALTER INDEX nodata_fan_idx ATTACH PARTITION nodata_fan1_idx;
+SELECT c.relname, i.indisnodata, i.indisvalid FROM pg_index i
+  JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE c.relname IN ('nodata_fan_idx', 'nodata_fan1_idx') ORDER BY 1;
+DROP TABLE nodata_fan;
+
+-- Populating the leaf index before attaching it avoids that second step
+-- entirely, since the attach itself performs the validation.
+CREATE TABLE nodata_fan2 (a int) PARTITION BY RANGE (a);
+CREATE TABLE nodata_fan2a PARTITION OF nodata_fan2 FOR VALUES FROM (0) TO (100);
+INSERT INTO nodata_fan2 SELECT generate_series(0, 99);
+CREATE INDEX nodata_fan2a_idx ON nodata_fan2a (a) WITH NO DATA;
+CREATE INDEX nodata_fan2_idx ON ONLY nodata_fan2 (a);
+REINDEX INDEX nodata_fan2a_idx;
+ALTER INDEX nodata_fan2_idx ATTACH PARTITION nodata_fan2a_idx;
+SELECT c.relname, i.indisnodata, i.indisvalid FROM pg_index i
+  JOIN pg_class c ON c.oid = i.indexrelid
+  WHERE c.relname IN ('nodata_fan2_idx', 'nodata_fan2a_idx') ORDER BY 1;
+DROP TABLE nodata_fan2;
+
+-- Completion is reachable by a MAINTAIN role that owns nothing: REINDEX is
+-- covered by MAINTAIN, while CREATE INDEX and DROP INDEX are not.  This
+-- privilege split is one of the two reasons the feature exists.
+CREATE ROLE regress_nodata_maint;
+CREATE TABLE nodata_priv (a int);
+INSERT INTO nodata_priv SELECT generate_series(1, 100);
+CREATE INDEX nodata_priv_idx ON nodata_priv (a) WITH NO DATA;
+GRANT MAINTAIN ON nodata_priv TO regress_nodata_maint;
+SET SESSION AUTHORIZATION regress_nodata_maint;
+CREATE INDEX nodata_priv_idx2 ON nodata_priv (a) WITH NO DATA;  -- fails
+DROP INDEX nodata_priv_idx;                                      -- fails
+REINDEX INDEX nodata_priv_idx;                                   -- succeeds
+RESET SESSION AUTHORIZATION;
+SELECT indisnodata, indisvalid, indisready FROM pg_index
+  WHERE indexrelid = 'nodata_priv_idx'::regclass;
+DROP TABLE nodata_priv;
+DROP ROLE regress_nodata_maint;
+
+-- A no-data index can be made the replica identity: the setting is recorded
+-- and takes effect once the index is populated, since RelationGetIndexList()
+-- will not use an index that is not yet valid.
+CREATE TABLE nodata_ri (a int NOT NULL);
+INSERT INTO nodata_ri SELECT generate_series(1, 100);
+CREATE UNIQUE INDEX nodata_ri_idx ON nodata_ri (a) WITH NO DATA;
+ALTER TABLE nodata_ri REPLICA IDENTITY USING INDEX nodata_ri_idx;
+SELECT relreplident FROM pg_class WHERE oid = 'nodata_ri'::regclass;
+SELECT pg_get_replica_identity_index('nodata_ri'::regclass) AS in_use;
+\d nodata_ri
+REINDEX INDEX nodata_ri_idx;
+SELECT pg_get_replica_identity_index('nodata_ri'::regclass) AS in_use;
+\d nodata_ri
+DROP TABLE nodata_ri;
+
+-- psql renders the no-data state instead of INVALID, since a no-data index is
+-- invalid but is not a crashed CREATE INDEX CONCURRENTLY.
+CREATE TABLE nodata_psql (a int, b text);
+CREATE INDEX nodata_psql_idx ON nodata_psql (a) WITH NO DATA;
+CREATE UNIQUE INDEX nodata_psql_uidx ON nodata_psql (b) WITH NO DATA;
+CREATE INDEX nodata_psql_ok ON nodata_psql (a);
+\d nodata_psql
+\d nodata_psql_idx
+\d nodata_psql_uidx
+-- and stops rendering it once the index is populated
+REINDEX INDEX nodata_psql_idx;
+\d nodata_psql_idx
+DROP TABLE nodata_psql;

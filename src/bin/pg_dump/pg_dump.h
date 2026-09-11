@@ -428,6 +428,7 @@ typedef struct _indxInfo
 								 * contains both key and nonkey attributes */
 	bool		indisclustered;
 	bool		indisreplident;
+	bool		indisnodata;	/* created WITH NO DATA, not yet populated */
 	bool		indnullsnotdistinct;
 	Oid			parentidx;		/* if a partition, parent index OID */
 	SimplePtrList partattaches; /* if partitioned, partition attach objects */

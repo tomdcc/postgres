@@ -4091,6 +4091,29 @@ my %tests = (
 		},
 	},
 
+	# An index created WITH NO DATA is dumped unpopulated, in every mode: a
+	# dump reproduces what it found, and building it on restore would perform
+	# the index build that was deliberately deferred.
+	'CREATE INDEX ... WITH NO DATA' => {
+		create_order => 101,
+		create_sql =>
+		  'CREATE INDEX test_table_nodata_idx ON dump_test.test_table (col2) WITH NO DATA;',
+		regexp => qr/^
+			\QCREATE INDEX test_table_nodata_idx ON dump_test.test_table USING btree (col2) WITH NO DATA;\E
+			/xm,
+		like => {
+			%full_runs,
+			%dump_test_schema_runs,
+			only_dump_test_table => 1,
+			section_post_data => 1,
+		},
+		unlike => {
+			exclude_dump_test_schema => 1,
+			exclude_test_table => 1,
+			only_dump_measurement => 1,
+		},
+	},
+
 	'CREATE INDEX ON ONLY measurement' => {
 		create_order => 92,
 		create_sql =>

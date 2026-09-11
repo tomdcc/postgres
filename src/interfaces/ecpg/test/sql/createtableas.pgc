@@ -32,6 +32,20 @@ main(void)
 	EXEC SQL SELECT count(id) INTO :id FROM cta_test2;
 	printf("ID = %d\n", id);
 
+	/*
+	 * The scanner turns WITH into WITH_LA_NO whenever NO follows it, so check
+	 * that a CTE named "no" still parses.
+	 */
+	EXEC SQL WITH no AS (SELECT id FROM cta_test) SELECT id INTO :id FROM no;
+	printf("ID = %d\n", id);
+
+	/* the clause the conversion exists for, on CREATE INDEX */
+	EXEC SQL CREATE INDEX cta_test_idx ON cta_test (id) WITH NO DATA;
+	EXEC SQL SELECT indisnodata::int INTO :id FROM pg_index
+	    WHERE indexrelid = 'cta_test_idx'::regclass;
+	printf("ID = %d\n", id);
+
+	EXEC SQL DROP INDEX cta_test_idx;
 	EXEC SQL DROP TABLE cta_test;
 	EXEC SQL DROP TABLE cta_test1;
 	EXEC SQL DROP TABLE cta_test2;

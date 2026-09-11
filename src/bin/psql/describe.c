@@ -2256,6 +2256,11 @@ describeOneTableDetails(const char *schemaname,
 		else
 			appendPQExpBufferStr(&buf, "false AS indnullsnotdistinct,\n");
 
+		if (pset.sversion >= 200000)
+			appendPQExpBufferStr(&buf, "i.indisnodata,\n");
+		else
+			appendPQExpBufferStr(&buf, "false AS indisnodata,\n");
+
 		appendPQExpBuffer(&buf, "  a.amname, c2.relname, "
 						  "pg_catalog.pg_get_expr(i.indpred, i.indrelid, true)\n"
 						  "FROM pg_catalog.pg_index i, pg_catalog.pg_class c, pg_catalog.pg_class c2, pg_catalog.pg_am a\n"
@@ -2281,9 +2286,10 @@ describeOneTableDetails(const char *schemaname,
 			char	   *deferred = PQgetvalue(result, 0, 5);
 			char	   *indisreplident = PQgetvalue(result, 0, 6);
 			char	   *indnullsnotdistinct = PQgetvalue(result, 0, 7);
-			char	   *indamname = PQgetvalue(result, 0, 8);
-			char	   *indtable = PQgetvalue(result, 0, 9);
-			char	   *indpred = PQgetvalue(result, 0, 10);
+			char	   *indisnodata = PQgetvalue(result, 0, 8);
+			char	   *indamname = PQgetvalue(result, 0, 9);
+			char	   *indtable = PQgetvalue(result, 0, 10);
+			char	   *indpred = PQgetvalue(result, 0, 11);
 
 			if (strcmp(indisprimary, "t") == 0)
 				printfPQExpBuffer(&tmpbuf, _("primary key, "));
@@ -2308,7 +2314,15 @@ describeOneTableDetails(const char *schemaname,
 			if (strcmp(indisclustered, "t") == 0)
 				appendPQExpBufferStr(&tmpbuf, _(", clustered"));
 
-			if (strcmp(indisvalid, "t") != 0)
+			/*
+			 * A no-data index is also invalid, but print only "no data".
+			 * Printing both would be noise, and the whole point of the flag
+			 * is to stop operators reading this as a crashed CREATE INDEX
+			 * CONCURRENTLY.
+			 */
+			if (strcmp(indisnodata, "t") == 0)
+				appendPQExpBufferStr(&tmpbuf, _(", no data"));
+			else if (strcmp(indisvalid, "t") != 0)
 				appendPQExpBufferStr(&tmpbuf, _(", invalid"));
 
 			if (strcmp(deferrable, "t") == 0)
@@ -2360,6 +2374,10 @@ describeOneTableDetails(const char *schemaname,
 				appendPQExpBufferStr(&buf, ", con.conperiod");
 			else
 				appendPQExpBufferStr(&buf, ", false AS conperiod");
+			if (pset.sversion >= 200000)
+				appendPQExpBufferStr(&buf, ", i.indisnodata");
+			else
+				appendPQExpBufferStr(&buf, ", false AS indisnodata");
 			appendPQExpBuffer(&buf,
 							  "\nFROM pg_catalog.pg_class c, pg_catalog.pg_class c2, pg_catalog.pg_index i\n"
 							  "  LEFT JOIN pg_catalog.pg_constraint con ON (conrelid = i.indrelid AND conindid = i.indexrelid AND contype IN ("
@@ -2429,7 +2447,15 @@ describeOneTableDetails(const char *schemaname,
 					if (strcmp(PQgetvalue(result, i, 3), "t") == 0)
 						appendPQExpBufferStr(&buf, " CLUSTER");
 
-					if (strcmp(PQgetvalue(result, i, 4), "t") != 0)
+					/*
+					 * A no-data index is also invalid, but do not say so: the
+					 * WITH NO DATA already echoed from its definition is both
+					 * more specific and the truer description, and INVALID
+					 * alongside it would suggest something is broken when
+					 * nothing is.
+					 */
+					if (strcmp(PQgetvalue(result, i, 13), "t") != 0 &&
+						strcmp(PQgetvalue(result, i, 4), "t") != 0)
 						appendPQExpBufferStr(&buf, " INVALID");
 
 					if (strcmp(PQgetvalue(result, i, 10), "t") == 0)
