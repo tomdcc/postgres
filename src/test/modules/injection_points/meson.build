@@ -51,6 +51,7 @@ tests += {
       'repack_commit_race',
       'repack_decode',
       'repack_missingval',
+      'repack_nodata',
       'repack_temporal',
       'repack_temporal_multirange',
       'repack_toast',

@@ -1,0 +1,66 @@
+Parsed test spec with 2 sessions
+
+starting permutation: repack write detach wakeup check reindex check_done
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step repack: REPACK (CONCURRENTLY) rpn_tab USING INDEX rpn_tab_pkey; <waiting ...>
+step write: INSERT INTO rpn_tab VALUES (21, 21), (22, 22);
+step detach: SELECT injection_points_detach('repack-concurrently-before-lock');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step wakeup: SELECT injection_points_wakeup('repack-concurrently-before-lock');
+injection_points_wakeup
+-----------------------
+                       
+(1 row)
+
+step repack: <... completed>
+step check: 
+    SELECT c.relname, i.indisnodata, i.indisvalid, i.indisready
+      FROM pg_class c JOIN pg_index i ON i.indexrelid = c.oid
+      WHERE c.relname IN ('rpn_plain', 'rpn_nodata')
+      ORDER BY c.relname;
+
+relname   |indisnodata|indisvalid|indisready
+----------+-----------+----------+----------
+rpn_nodata|t          |f         |f         
+rpn_plain |f          |t         |t         
+(2 rows)
+
+step reindex: REINDEX INDEX rpn_nodata;
+step check_done: 
+    SELECT indisnodata, indisvalid, indisready FROM pg_index
+      WHERE indexrelid = 'rpn_nodata'::regclass;
+    SELECT count(*) FROM rpn_tab WHERE j > 20;
+
+indisnodata|indisvalid|indisready
+-----------+----------+----------
+f          |t         |t         
+(1 row)
+
+count
+-----
+    2
+(1 row)
+
+
+starting permutation: detach repack_ri
+injection_points_attach
+-----------------------
+                       
+(1 row)
+
+step detach: SELECT injection_points_detach('repack-concurrently-before-lock');
+injection_points_detach
+-----------------------
+                       
+(1 row)
+
+step repack_ri: REPACK (CONCURRENTLY) rpn_ri;
+ERROR:  cannot execute REPACK (CONCURRENTLY) on relation "rpn_ri"
