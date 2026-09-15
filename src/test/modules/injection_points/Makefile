@@ -20,6 +20,7 @@ ISOLATION = basic \
 	    reindex_concurrently_nodata \
 	    repack \
 	    repack_decode \
+	    repack_nodata \
 	    repack_temporal \
 	    repack_temporal_multirange \
 	    repack_toast \

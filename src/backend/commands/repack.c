@@ -893,6 +893,12 @@ mark_index_clustered(Relation rel, Oid indexOid, bool is_internal)
  * may fail to build altogether.  Throwing an error here forces the user to
  * take action on these indexes separately from the table reconstruction,
  * which prevents perpetuating them for no reason.
+ *
+ * An index created WITH NO DATA is exempt.  It is unready for a different
+ * reason: it holds no entries by request, so there is nothing to perpetuate
+ * and nothing that can fail to build.  The test is on indisnodata rather than
+ * a weaker test of readiness, so that the leftovers this check exists to catch
+ * are still caught.
  */
 static void
 check_index_requirements(Relation rel, RepackCommand cmd)
@@ -920,7 +926,7 @@ check_index_requirements(Relation rel, RepackCommand cmd)
 	{
 		Form_pg_index index = (Form_pg_index) GETSTRUCT(htup);
 
-		if (!index->indisready)
+		if (!index->indisready && !index->indisnodata)
 		{
 			Assert(!index->indisvalid);
 			if (num_invalid_idxs == 0)
@@ -3334,6 +3340,29 @@ rebuild_relation_finish_concurrent(Relation NewHeap, Relation OldHeap,
 
 	Assert(CheckRelationLockedByMe(OldHeap, ShareUpdateExclusiveLock, false));
 	Assert(CheckRelationLockedByMe(NewHeap, AccessExclusiveLock, false));
+
+	/*
+	 * Leave any index created WITH NO DATA out of the rebuild.  It holds no
+	 * entries, so it refers to none of the tuple identifiers the new heap
+	 * invalidates, and its storage stays correct untouched.  Building a copy
+	 * would populate an index the user deferred, which is the one thing the
+	 * clause promises not to do.
+	 *
+	 * The non-concurrent path does not merely skip such an index: it gives it
+	 * fresh storage of the new heap's persistence, because finish_heap_swap()
+	 * may be changing that persistence.  Nothing here can, since
+	 * check_concurrent_repack_requirements() accepts permanent relations
+	 * only, so the index's existing storage is already persisted correctly.
+	 *
+	 * Drop it here rather than in build_new_indexes(), because that
+	 * function's result is matched to this list by position when the index
+	 * storage is swapped below.
+	 */
+	foreach_oid(indoid, ind_oids_old)
+	{
+		if (get_index_isnodata(indoid))
+			ind_oids_old = foreach_delete_current(ind_oids_old, indoid);
+	}
 
 	/*
 	 * Unlike the exclusive case, we build new indexes for the new relation
