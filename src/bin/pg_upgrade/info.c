@@ -534,6 +534,14 @@ get_rel_infos_query(void)
 	 * selected tables.  We can ignore invalid indexes since pg_dump does.
 	 * Testing indisready is necessary in 9.2, and harmless in earlier/later
 	 * versions.
+	 *
+	 * An index created WITH NO DATA is not valid, so it is excluded here even
+	 * though pg_dump does dump it.  That is correct rather than an oversight:
+	 * the new cluster creates it unpopulated, so it has no contents to
+	 * transfer whatever relfilenumber it is given.  Because the new cluster's
+	 * copy is likewise not valid, this same filter excludes it on both sides
+	 * and the two relation lists stay in step -- which matters, since
+	 * gen_db_file_maps() aborts on any unmatched relation.
 	 */
 	appendPQExpBufferStr(&query,
 						 "  all_index (reloid, indtable, toastheap) AS ( "

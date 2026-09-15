@@ -235,6 +235,37 @@ REINDEX [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] { DA
   </para>
 
   <para>
+   <command>REINDEX INDEX</command> is the only way to populate an index
+   created with
+   <link linkend="sql-createindex-with-no-data"><command>CREATE INDEX ... WITH
+   NO DATA</command></link>, and it must name that index, or a partitioned
+   index above it; <command>REINDEX TABLE</command>,
+   <command>REINDEX SCHEMA</command> and <command>REINDEX DATABASE</command>
+   skip such indexes rather than populating them.
+  </para>
+
+  <para>
+   Naming a partitioned index populates every partition's index and ends the
+   deferred state throughout the tree.  It does not mark the partitioned indexes
+   valid: <command>REINDEX</command> never recomputes the validity of a
+   partitioned index, whether or not it was deferred.  See
+   <xref linkend="sql-createindex-with-no-data"/> for how to do that.
+  </para>
+
+  <caution>
+   <para>
+    <command>REINDEX INDEX CONCURRENTLY</command> on a unique index created
+    with <link linkend="sql-createindex-with-no-data"><command>CREATE INDEX
+    ... WITH NO DATA</command></link> enforces uniqueness the way
+    <command>CREATE INDEX CONCURRENTLY</command> does, not the way an ordinary
+    concurrent reindex does, since there was nothing enforcing uniqueness
+    prior to the <command>REINDEX</command>.  The caveats given for building a
+    unique index concurrently
+    under <xref linkend="sql-createindex-concurrently"/> apply.
+   </para>
+  </caution>
+
+  <para>
    Things are more difficult if you need to recover from corruption of
    an index on a system table.  In this case it's important for the
    system to not have used any of the suspect indexes itself.

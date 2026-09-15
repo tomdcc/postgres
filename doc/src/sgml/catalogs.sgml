@@ -4566,6 +4566,29 @@ SCRAM-SHA-256$<replaceable>&lt;iteration count&gt;</replaceable>:<replaceable>&l
 
      <row>
       <entry role="catalog_table_entry"><para role="column_definition">
+       <structfield>indisnodata</structfield> <type>bool</type>
+      </para>
+      <para>
+       If true this index was created with
+       <link linkend="sql-createindex"><command>CREATE INDEX ... WITH NO
+       DATA</command></link> and has not been populated yet.  On an index with
+       storage this means it contains no entries and is not maintained, and
+       <structfield>indisvalid</structfield> and
+       <structfield>indisready</structfield> are both false.  A partitioned
+       index has no storage of its own, and there the flag instead records that
+       the tree was declared with the clause, so that partitions attached later
+       inherit it; such an index has <structfield>indisready</structfield> true
+       and <structfield>indisvalid</structfield> false.  In both cases the flag
+       is cleared by a
+       <link linkend="sql-reindex"><command>REINDEX INDEX</command></link>
+       naming the index, which populates it if it has storage, and it
+       distinguishes a deliberately unpopulated index from one left behind by
+       a failed <command>CREATE INDEX CONCURRENTLY</command>.
+      </para></entry>
+     </row>
+
+     <row>
+      <entry role="catalog_table_entry"><para role="column_definition">
        <structfield>indkey</structfield> <type>int2vector</type>
        (references <link linkend="catalog-pg-attribute"><structname>pg_attribute</structname></link>.<structfield>attnum</structfield>)
       </para>

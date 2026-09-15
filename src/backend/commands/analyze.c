@@ -445,8 +445,7 @@ do_analyze_rel(Relation onerel, const VacuumParams *params,
 	}
 	else if (!inh)
 	{
-		vac_open_indexes(onerel, AccessShareLock, &nindexes, &Irel);
-		hasindex = nindexes > 0;
+		vac_open_indexes(onerel, AccessShareLock, &nindexes, &Irel, &hasindex);
 	}
 	else
 	{
