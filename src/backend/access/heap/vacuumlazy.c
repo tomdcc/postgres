@@ -255,6 +255,8 @@ typedef struct LVRelState
 	Relation	rel;
 	Relation   *indrels;
 	int			nindexes;
+	/* Whether the relation has any indexes, vacuumable or not */
+	bool		hasindex;
 
 	/* Buffer access strategy and parallel vacuum state */
 	BufferAccessStrategy bstrategy;
@@ -698,7 +700,7 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
 	/* Set up high level stuff about rel and its indexes */
 	vacrel->rel = rel;
 	vac_open_indexes(vacrel->rel, RowExclusiveLock, &vacrel->nindexes,
-					 &vacrel->indrels);
+					 &vacrel->indrels, &vacrel->hasindex);
 	vacrel->bstrategy = bstrategy;
 	if (instrument && vacrel->nindexes > 0)
 	{
@@ -970,7 +972,7 @@ heap_vacuum_rel(Relation rel, const VacuumParams *params,
 	 */
 	vac_update_relstats(rel, new_rel_pages, vacrel->new_live_tuples,
 						new_rel_allvisible, new_rel_allfrozen,
-						vacrel->nindexes > 0,
+						vacrel->hasindex,
 						vacrel->NewRelfrozenXid, vacrel->NewRelminMxid,
 						&frozenxid_updated, &minmulti_updated, false);
 
@@ -1964,11 +1966,11 @@ lazy_scan_new_or_empty(LVRelState *vacrel, Buffer buf, BlockNumber blkno,
 
 			PageSetAllVisible(page);
 			PageClearPrunable(page);
-			visibilitymap_set(blkno,
-							  vmbuffer,
-							  VISIBILITYMAP_ALL_VISIBLE |
-							  VISIBILITYMAP_ALL_FROZEN,
-							  vacrel->rel->rd_locator);
+			(void) visibilitymap_set(blkno,
+									 vmbuffer,
+									 VISIBILITYMAP_ALL_VISIBLE |
+									 VISIBILITYMAP_ALL_FROZEN,
+									 vacrel->rel->rd_locator);
 
 			/*
 			 * Emit WAL for setting PD_ALL_VISIBLE on the heap page and
@@ -2846,9 +2848,9 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
 		 */
 		PageSetAllVisible(page);
 		PageClearPrunable(page);
-		visibilitymap_set(blkno,
-						  vmbuffer, vmflags,
-						  vacrel->rel->rd_locator);
+		(void) visibilitymap_set(blkno,
+								 vmbuffer, vmflags,
+								 vacrel->rel->rd_locator);
 		conflict_xid = newest_live_xid;
 	}
 
@@ -3038,15 +3040,26 @@ lazy_vacuum_one_index(Relation indrel, IndexBulkDeleteResult *istat,
 {
 	IndexVacuumInfo ivinfo;
 	LVSavedErrInfo saved_err_info;
+	const int	reset_index[] = {
+		PROGRESS_VACUUM_CURRENT_INDEX_RELID,
+		PROGRESS_SCAN_BLOCKS_TOTAL,
+		PROGRESS_SCAN_BLOCKS_DONE
+	};
+	const int64 reset_val[] = {(int64) InvalidOid, 0, 0};
 
 	ivinfo.index = indrel;
 	ivinfo.heaprel = vacrel->rel;
 	ivinfo.analyze_only = false;
-	ivinfo.report_progress = false;
+	ivinfo.is_autovacuum = AmAutoVacuumWorkerProcess();
+	ivinfo.report_progress = true;
 	ivinfo.estimated_count = true;
 	ivinfo.message_level = DEBUG2;
 	ivinfo.num_heap_tuples = reltuples;
 	ivinfo.strategy = vacrel->bstrategy;
+
+	/* Report which index we're currently processing */
+	pgstat_progress_update_param(PROGRESS_VACUUM_CURRENT_INDEX_RELID,
+								 (int64) RelationGetRelid(indrel));
 
 	/*
 	 * Update error traceback information.
@@ -3069,6 +3082,8 @@ lazy_vacuum_one_index(Relation indrel, IndexBulkDeleteResult *istat,
 	pfree(vacrel->indname);
 	vacrel->indname = NULL;
 
+	pgstat_progress_update_multi_param(3, reset_index, reset_val);
+
 	return istat;
 }
 
@@ -3088,16 +3103,27 @@ lazy_cleanup_one_index(Relation indrel, IndexBulkDeleteResult *istat,
 {
 	IndexVacuumInfo ivinfo;
 	LVSavedErrInfo saved_err_info;
+	const int	reset_index[] = {
+		PROGRESS_VACUUM_CURRENT_INDEX_RELID,
+		PROGRESS_SCAN_BLOCKS_TOTAL,
+		PROGRESS_SCAN_BLOCKS_DONE
+	};
+	const int64 reset_val[] = {(int64) InvalidOid, 0, 0};
 
 	ivinfo.index = indrel;
 	ivinfo.heaprel = vacrel->rel;
 	ivinfo.analyze_only = false;
-	ivinfo.report_progress = false;
+	ivinfo.is_autovacuum = AmAutoVacuumWorkerProcess();
+	ivinfo.report_progress = true;
 	ivinfo.estimated_count = estimated_count;
 	ivinfo.message_level = DEBUG2;
 
 	ivinfo.num_heap_tuples = reltuples;
 	ivinfo.strategy = vacrel->bstrategy;
+
+	/* Report which index we're currently processing */
+	pgstat_progress_update_param(PROGRESS_VACUUM_CURRENT_INDEX_RELID,
+								 (int64) RelationGetRelid(indrel));
 
 	/*
 	 * Update error traceback information.
@@ -3117,6 +3143,8 @@ lazy_cleanup_one_index(Relation indrel, IndexBulkDeleteResult *istat,
 	restore_vacuum_error_info(vacrel, &saved_err_info);
 	pfree(vacrel->indname);
 	vacrel->indname = NULL;
+
+	pgstat_progress_update_multi_param(3, reset_index, reset_val);
 
 	return istat;
 }

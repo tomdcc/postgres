@@ -55,6 +55,7 @@
 #include "utils/sampling.h"
 #include "utils/selfuncs.h"
 #include "utils/timestamp.h"
+#include "utils/typcache.h"
 
 PG_MODULE_MAGIC_EXT(
 					.name = "postgres_fdw",
@@ -596,6 +597,7 @@ static bool fetch_remote_statistics(Relation relation,
 									const char *local_schemaname,
 									const char *local_relname,
 									ForeignTable *table,
+									ForeignServer *server,
 									RemoteStatsResults *remstats,
 									RemoteAttributeMapping **p_remattrmap,
 									int *p_attrcnt);
@@ -5763,7 +5765,7 @@ postgresImportForeignStatistics(Relation relation, List *va_cols, int elevel)
 	starttime = GetCurrentTimestamp();
 
 	ok = fetch_remote_statistics(relation, va_cols,
-								 schemaname, relname, table,
+								 schemaname, relname, table, server,
 								 &remstats, &remattrmap, &attrcnt);
 
 	if (ok)
@@ -5796,6 +5798,7 @@ fetch_remote_statistics(Relation relation,
 						const char *local_schemaname,
 						const char *local_relname,
 						ForeignTable *table,
+						ForeignServer *server,
 						RemoteStatsResults *remstats,
 						RemoteAttributeMapping **p_remattrmap,
 						int *p_attrcnt)
@@ -5829,11 +5832,10 @@ fetch_remote_statistics(Relation relation,
 	}
 
 	/*
-	 * Get connection to the foreign server.  Connection manager will
-	 * establish new connection if necessary.
-	 *
-	 * Note that unlike the sampling case, we only query pg_class and
-	 * pg_stats, so we do the remote access as the current user.
+	 * Get the connection to use.  We do the remote access as the table's
+	 * owner.  Note that unlike AnalyzeForeignTable(), the core code would
+	 * already have switched us to the table's owner, before we are called
+	 * from ImportForeignStatistics().
 	 */
 	user = GetUserMapping(GetUserId(), table->serverid);
 	conn = GetConnection(user, false, NULL);
@@ -5912,6 +5914,19 @@ fetch_remote_statistics(Relation relation,
 		/* Try to get attribute stats if needed. */
 		if (attrcnt > 0)
 		{
+			/*
+			 * The fetch_attstats query sends COLLATE "C" to the remote
+			 * server; if it hasn't got it, fallback to sampling.
+			 */
+			if (server_version_num < 90100)
+			{
+				ereport(WARNING,
+						errmsg("could not import statistics for foreign table \"%s.%s\" --- foreign server \"%s\" is too old to support attribute statistics import",
+							   local_schemaname, local_relname,
+							   server->servername));
+				goto fetch_cleanup;
+			}
+
 			/* Fetch attribute stats. */
 			remstats->att = attstats = fetch_attstats(conn,
 													  server_version_num,
@@ -5939,7 +5954,10 @@ fetch_remote_statistics(Relation relation,
 
 	/*
 	 * If the remote table is partitioned, import relpages = 0, to match the
-	 * sampling case.
+	 * sampling path.  Otherwise, import the relpages value as-is, regardless
+	 * of any difference between the remote and local block sizes.  Note that
+	 * this is fine because it's only used for costing remote operations on
+	 * the foreign table.
 	 */
 	if (relkind == RELKIND_PARTITIONED_TABLE)
 		remstats->relpages = 0;
@@ -5987,9 +6005,23 @@ fetch_attstats(PGconn *conn, int server_version_num,
 	StringInfoData sql;
 	PGresult   *res;
 
+	/*
+	 * The caller guarantees the remote server is v9.1, which supported
+	 * COLLATE "C", or later
+	 */
+	Assert(server_version_num >= 90100);
+
 	initStringInfo(&sql);
+
+	/* Type name is collatable since Postgres 12 */
+	if (server_version_num >= 120000)
+		appendStringInfoString(&sql,
+							   "SELECT DISTINCT ON (attname COLLATE \"C\") attname,");
+	else
+		appendStringInfoString(&sql,
+							   "SELECT DISTINCT ON (attname::text COLLATE \"C\") attname,");
+
 	appendStringInfoString(&sql,
-						   "SELECT DISTINCT ON (attname COLLATE \"C\") attname,"
 						   " null_frac,"
 						   " avg_width,"
 						   " n_distinct,"
@@ -5999,7 +6031,7 @@ fetch_attstats(PGconn *conn, int server_version_num,
 						   " correlation,");
 
 	/* Elements stats are supported since Postgres 9.2 */
-	if (server_version_num >= 92000)
+	if (server_version_num >= 90200)
 		appendStringInfoString(&sql,
 							   " most_common_elems,"
 							   " most_common_elem_freqs,"
@@ -6030,18 +6062,15 @@ fetch_attstats(PGconn *conn, int server_version_num,
 					 column_list);
 
 	/*
-	 * inherited is supported since Postgres 9.0
-	 *
-	 * Note that this is okay because for now, we support the case where the
-	 * remote table is partitioned, but not the case where it is inherited
-	 * (see fetch_remote_statistics()).
+	 * Type name is collatable since Postgres 12  (inherited is supported
+	 * since Postgres 9.0)
 	 */
-	if (server_version_num >= 90000)
+	if (server_version_num >= 120000)
 		appendStringInfoString(&sql,
 							   " ORDER BY attname COLLATE \"C\", inherited DESC");
 	else
 		appendStringInfoString(&sql,
-							   " ORDER BY attname COLLATE \"C\"");
+							   " ORDER BY attname::text COLLATE \"C\", inherited DESC");
 
 	res = pgfdw_exec_query(conn, sql.data, NULL);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)

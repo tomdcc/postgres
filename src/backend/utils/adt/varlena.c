@@ -2154,21 +2154,16 @@ varstr_abbrev_convert(Datum original, SortSupport ssup)
 	 * in order to compensate for cases where differences are past
 	 * PG_CACHE_LINE_SIZE bytes, so as to limit the overhead of hashing.
 	 */
-	hash = DatumGetUInt32(hash_any((unsigned char *) authoritative_data,
-								   Min(len, PG_CACHE_LINE_SIZE)));
+	hash = hash_bytes((unsigned char *) authoritative_data,
+					  Min(len, PG_CACHE_LINE_SIZE));
 
 	if (len > PG_CACHE_LINE_SIZE)
-		hash ^= DatumGetUInt32(hash_uint32((uint32) len));
+		hash ^= murmurhash32((uint32) len);
 
 	addHyperLogLog(&sss->full_card, hash);
 
 	/* Hash abbreviated key */
-	{
-		uint32		tmp;
-
-		tmp = DatumGetUInt32(res) ^ (uint32) (DatumGetUInt64(res) >> 32);
-		hash = DatumGetUInt32(hash_uint32(tmp));
-	}
+	hash = (uint32) murmurhash64(DatumGetUInt64(res));
 
 	addHyperLogLog(&sss->abbr_card, hash);
 
@@ -4261,7 +4256,7 @@ pg_column_toast_chunk_id(PG_FUNCTION_ARGS)
 {
 	int			typlen;
 	varlena    *attr;
-	varatt_external_oid toast_pointer;
+	toast_external_data toast_ext_data;
 
 	/* On first call, get the input type's typlen, and save at *fn_extra */
 	if (fcinfo->flinfo->fn_extra == NULL)
@@ -4288,9 +4283,9 @@ pg_column_toast_chunk_id(PG_FUNCTION_ARGS)
 	if (!VARATT_IS_EXTERNAL_ONDISK(attr))
 		PG_RETURN_NULL();
 
-	VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
+	toast_external_info_get(attr, &toast_ext_data);
 
-	PG_RETURN_OID(toast_pointer.va_valueid);
+	PG_RETURN_OID8(toast_ext_data.valueid);
 }
 
 /*

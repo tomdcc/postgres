@@ -16,6 +16,7 @@
 #include "access/detoast.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/toast_compression.h"
 #include "access/toast_internals.h"
 #include "common/int.h"
 #include "common/pg_lzcompress.h"
@@ -225,12 +226,18 @@ detoast_attr_slice(varlena *attr,
 
 	if (VARATT_IS_EXTERNAL_ONDISK(attr))
 	{
-		varatt_external_oid toast_pointer;
+		toast_external_data toast_ext_data;
+		int32		extsize;
+		uint32		compress_method;
+		bool		is_compressed;
 
-		VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
+		toast_external_info_get(attr, &toast_ext_data);
+		extsize = VARATT_EXTINFO_GET_EXTSIZE(toast_ext_data.extinfo);
+		compress_method = VARATT_EXTINFO_GET_COMPRESS_METHOD(toast_ext_data.extinfo);
+		is_compressed = VARATT_EXTINFO_IS_COMPRESSED(toast_ext_data.extinfo, toast_ext_data.rawsize);
 
 		/* fast path for non-compressed external datums */
-		if (!VARATT_EXTERNAL_OID_IS_COMPRESSED(toast_pointer))
+		if (!is_compressed)
 			return toast_fetch_datum_slice(attr, sliceoffset, slicelength);
 
 		/*
@@ -240,7 +247,7 @@ detoast_attr_slice(varlena *attr,
 		 */
 		if (slicelimit >= 0)
 		{
-			int32		max_size = VARATT_EXTERNAL_OID_GET_EXTSIZE(toast_pointer);
+			int32		max_size = extsize;
 
 			/*
 			 * Determine maximum amount of compressed data needed for a prefix
@@ -251,8 +258,7 @@ detoast_attr_slice(varlena *attr,
 			 * determine how much compressed data we need to be sure of being
 			 * able to decompress the required slice.
 			 */
-			if (VARATT_EXTERNAL_OID_GET_COMPRESS_METHOD(toast_pointer) ==
-				TOAST_PGLZ_COMPRESSION_ID)
+			if (compress_method == TOAST_PGLZ_COMPRESSION_ID)
 				max_size = pglz_maximum_compressed_size(slicelimit, max_size);
 
 			/*
@@ -344,20 +350,22 @@ toast_fetch_datum(varlena *attr)
 {
 	Relation	toastrel;
 	varlena    *result;
-	varatt_external_oid toast_pointer;
+	toast_external_data toast_ext_data;
 	int32		attrsize;
+	Oid			toastrelid;
+	Oid8		valueid;
 
 	if (!VARATT_IS_EXTERNAL_ONDISK(attr))
 		elog(ERROR, "toast_fetch_datum shouldn't be called for non-ondisk datums");
 
-	/* Must copy to access aligned fields */
-	VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
-
-	attrsize = VARATT_EXTERNAL_OID_GET_EXTSIZE(toast_pointer);
+	toast_external_info_get(attr, &toast_ext_data);
+	attrsize = VARATT_EXTINFO_GET_EXTSIZE(toast_ext_data.extinfo);
+	toastrelid = toast_ext_data.toastrelid;
+	valueid = toast_ext_data.valueid;
 
 	result = (varlena *) palloc(attrsize + VARHDRSZ);
 
-	if (VARATT_EXTERNAL_OID_IS_COMPRESSED(toast_pointer))
+	if (VARATT_EXTINFO_IS_COMPRESSED(toast_ext_data.extinfo, toast_ext_data.rawsize))
 		SET_VARSIZE_COMPRESSED(result, attrsize + VARHDRSZ);
 	else
 		SET_VARSIZE(result, attrsize + VARHDRSZ);
@@ -369,10 +377,10 @@ toast_fetch_datum(varlena *attr)
 	/*
 	 * Open the toast relation and its indexes
 	 */
-	toastrel = table_open(toast_pointer.va_toastrelid, AccessShareLock);
+	toastrel = table_open(toastrelid, AccessShareLock);
 
 	/* Fetch all chunks */
-	table_relation_fetch_toast_slice(toastrel, toast_pointer.va_valueid,
+	table_relation_fetch_toast_slice(toastrel, valueid,
 									 attrsize, 0, attrsize, result);
 
 	/* Close toast table */
@@ -398,23 +406,27 @@ toast_fetch_datum_slice(varlena *attr, int32 sliceoffset,
 {
 	Relation	toastrel;
 	varlena    *result;
-	varatt_external_oid toast_pointer;
+	toast_external_data toast_ext_data;
 	int32		attrsize;
+	Oid			toastrelid;
+	Oid8		valueid;
+	bool		is_compressed;
 
 	if (!VARATT_IS_EXTERNAL_ONDISK(attr))
 		elog(ERROR, "toast_fetch_datum_slice shouldn't be called for non-ondisk datums");
 
-	/* Must copy to access aligned fields */
-	VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
+	toast_external_info_get(attr, &toast_ext_data);
+	attrsize = VARATT_EXTINFO_GET_EXTSIZE(toast_ext_data.extinfo);
+	toastrelid = toast_ext_data.toastrelid;
+	valueid = toast_ext_data.valueid;
+	is_compressed = VARATT_EXTINFO_IS_COMPRESSED(toast_ext_data.extinfo, toast_ext_data.rawsize);
 
 	/*
 	 * It's nonsense to fetch slices of a compressed datum unless when it's a
 	 * prefix -- this isn't lo_* we can't return a compressed datum which is
 	 * meaningful to toast later.
 	 */
-	Assert(!VARATT_EXTERNAL_OID_IS_COMPRESSED(toast_pointer) || 0 == sliceoffset);
-
-	attrsize = VARATT_EXTERNAL_OID_GET_EXTSIZE(toast_pointer);
+	Assert(!is_compressed || 0 == sliceoffset);
 
 	if (sliceoffset >= attrsize)
 	{
@@ -427,7 +439,7 @@ toast_fetch_datum_slice(varlena *attr, int32 sliceoffset,
 	 * space required by va_tcinfo, which is stored at the beginning as an
 	 * int32 value.
 	 */
-	if (VARATT_EXTERNAL_OID_IS_COMPRESSED(toast_pointer) && slicelength > 0)
+	if (is_compressed && slicelength > 0)
 		slicelength = slicelength + sizeof(int32);
 
 	/*
@@ -440,7 +452,7 @@ toast_fetch_datum_slice(varlena *attr, int32 sliceoffset,
 
 	result = (varlena *) palloc(slicelength + VARHDRSZ);
 
-	if (VARATT_EXTERNAL_OID_IS_COMPRESSED(toast_pointer))
+	if (is_compressed)
 		SET_VARSIZE_COMPRESSED(result, slicelength + VARHDRSZ);
 	else
 		SET_VARSIZE(result, slicelength + VARHDRSZ);
@@ -449,10 +461,10 @@ toast_fetch_datum_slice(varlena *attr, int32 sliceoffset,
 		return result;			/* Can save a lot of work at this point! */
 
 	/* Open the toast relation */
-	toastrel = table_open(toast_pointer.va_toastrelid, AccessShareLock);
+	toastrel = table_open(toastrelid, AccessShareLock);
 
 	/* Fetch all chunks */
-	table_relation_fetch_toast_slice(toastrel, toast_pointer.va_valueid,
+	table_relation_fetch_toast_slice(toastrel, valueid,
 									 attrsize, sliceoffset, slicelength,
 									 result);
 
@@ -478,7 +490,7 @@ toast_decompress_datum(varlena *attr)
 	 * Fetch the compression method id stored in the compression header and
 	 * decompress the data using the appropriate decompression routine.
 	 */
-	cmid = TOAST_COMPRESS_METHOD(attr);
+	cmid = VARDATA_COMPRESSED_GET_COMPRESS_METHOD(attr);
 	switch (cmid)
 	{
 		case TOAST_PGLZ_COMPRESSION_ID:
@@ -514,14 +526,14 @@ toast_decompress_datum_slice(varlena *attr, int32 slicelength)
 	 * have been seen to give wrong results if passed an output size that is
 	 * more than the data's true decompressed size.
 	 */
-	if ((uint32) slicelength >= TOAST_COMPRESS_EXTSIZE(attr))
+	if ((uint32) slicelength >= VARDATA_COMPRESSED_GET_EXTSIZE(attr))
 		return toast_decompress_datum(attr);
 
 	/*
 	 * Fetch the compression method id stored in the compression header and
 	 * decompress the data slice using the appropriate decompression routine.
 	 */
-	cmid = TOAST_COMPRESS_METHOD(attr);
+	cmid = VARDATA_COMPRESSED_GET_COMPRESS_METHOD(attr);
 	switch (cmid)
 	{
 		case TOAST_PGLZ_COMPRESSION_ID:
@@ -550,10 +562,10 @@ toast_raw_datum_size(Datum value)
 	if (VARATT_IS_EXTERNAL_ONDISK(attr))
 	{
 		/* va_rawsize is the size of the original datum -- including header */
-		varatt_external_oid toast_pointer;
+		toast_external_data toast_ext_data;
 
-		VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
-		result = toast_pointer.va_rawsize;
+		toast_external_info_get(attr, &toast_ext_data);
+		result = toast_ext_data.rawsize;
 	}
 	else if (VARATT_IS_EXTERNAL_INDIRECT(attr))
 	{
@@ -610,10 +622,10 @@ toast_datum_size(Datum value)
 		 * compressed or not.  We do not count the size of the toast pointer
 		 * ... should we?
 		 */
-		varatt_external_oid toast_pointer;
+		toast_external_data toast_ext_data;
 
-		VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
-		result = VARATT_EXTERNAL_OID_GET_EXTSIZE(toast_pointer);
+		toast_external_info_get(attr, &toast_ext_data);
+		result = VARATT_EXTINFO_GET_EXTSIZE(toast_ext_data.extinfo);
 	}
 	else if (VARATT_IS_EXTERNAL_INDIRECT(attr))
 	{

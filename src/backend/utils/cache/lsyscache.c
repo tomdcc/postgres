@@ -3783,31 +3783,6 @@ get_range_collation(Oid rangeOid)
 }
 
 /*
- * get_range_constructor2
- *		Gets the 2-arg constructor for the given rangetype.
- *
- *	Raises an error if not found.
- */
-RegProcedure
-get_range_constructor2(Oid rangeOid)
-{
-	HeapTuple	tp;
-
-	tp = SearchSysCache1(RANGETYPE, ObjectIdGetDatum(rangeOid));
-	if (HeapTupleIsValid(tp))
-	{
-		Form_pg_range rngtup = (Form_pg_range) GETSTRUCT(tp);
-		RegProcedure result;
-
-		result = rngtup->rngconstruct2;
-		ReleaseSysCache(tp);
-		return result;
-	}
-	else
-		elog(ERROR, "cache lookup failed for range type %u", rangeOid);
-}
-
-/*
  * get_range_multirange
  *		Returns the multirange type of a given range type
  *
@@ -3949,6 +3924,29 @@ get_index_isvalid(Oid index_oid)
 	ReleaseSysCache(tuple);
 
 	return isvalid;
+}
+
+/*
+ * get_index_isnodata
+ *
+ *		Given the index OID, return pg_index.indisnodata.
+ */
+bool
+get_index_isnodata(Oid index_oid)
+{
+	bool		isnodata;
+	HeapTuple	tuple;
+	Form_pg_index rd_index;
+
+	tuple = SearchSysCache1(INDEXRELID, ObjectIdGetDatum(index_oid));
+	if (!HeapTupleIsValid(tuple))
+		elog(ERROR, "cache lookup failed for index %u", index_oid);
+
+	rd_index = (Form_pg_index) GETSTRUCT(tuple);
+	isnodata = rd_index->indisnodata;
+	ReleaseSysCache(tuple);
+
+	return isnodata;
 }
 
 /*

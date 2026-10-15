@@ -3964,6 +3964,31 @@ my %tests = (
 		},
 	},
 
+	'CREATE TABLE table_with_constraint_stats' => {
+		create_order => 98,
+		create_sql => 'CREATE TABLE dump_test.table_constraint_stats (
+						   col1 int,
+						   col2 int);
+						 ALTER TABLE dump_test.table_constraint_stats
+						   ADD CONSTRAINT ex_with_stats
+						   EXCLUDE USING btree ((col1 + 1) WITH =,
+							 col1 WITH =, (col2 + 1) WITH =);
+						 ALTER INDEX dump_test.ex_with_stats
+						   ALTER COLUMN 1 SET STATISTICS 100;
+						 ALTER INDEX dump_test.ex_with_stats
+						   ALTER COLUMN 3 SET STATISTICS 200;',
+		regexp => qr/^
+			\QALTER INDEX dump_test.ex_with_stats ALTER COLUMN 1 SET STATISTICS 100;\E\n
+			\QALTER INDEX dump_test.ex_with_stats ALTER COLUMN 3 SET STATISTICS 200;\E\n
+			/xms,
+		like =>
+		  { %full_runs, %dump_test_schema_runs, section_post_data => 1, },
+		unlike => {
+			exclude_dump_test_schema => 1,
+			only_dump_measurement => 1,
+		},
+	},
+
 	'CREATE TABLE test_inheritance_parent' => {
 		create_order => 90,
 		create_sql => 'CREATE TABLE dump_test.test_inheritance_parent (
@@ -4084,6 +4109,84 @@ my %tests = (
 			%dump_test_schema_runs,
 			only_dump_test_table => 1,
 			section_pre_data => 1,
+		},
+		unlike => {
+			exclude_dump_test_schema => 1,
+			only_dump_measurement => 1,
+		},
+	},
+
+	# An index created WITH NO DATA is dumped unpopulated, in every mode: a
+	# dump reproduces what it found, and building it on restore would perform
+	# the index build that was deliberately deferred.
+	'CREATE INDEX ... WITH NO DATA' => {
+		create_order => 101,
+		create_sql =>
+		  'CREATE INDEX test_table_nodata_idx ON dump_test.test_table (col2) WITH NO DATA;',
+		regexp => qr/^
+			\QCREATE INDEX test_table_nodata_idx ON dump_test.test_table USING btree (col2) WITH NO DATA;\E
+			/xm,
+		like => {
+			%full_runs,
+			%dump_test_schema_runs,
+			only_dump_test_table => 1,
+			section_post_data => 1,
+		},
+		unlike => {
+			exclude_dump_test_schema => 1,
+			exclude_test_table => 1,
+			only_dump_measurement => 1,
+		},
+	},
+
+	# The same on a partitioned tree, where the deferral is recorded on an
+	# index that has no storage of its own.  Such an index is indisready from
+	# the start, and stays so once REINDEX has populated the partitions and
+	# re-attaching a partition's index has made the tree valid: pg_dump
+	# selects on indisready, so an index left unready here would be dropped
+	# from the dump silently, taking the tree with it and leaving the
+	# partitions' indexes behind as standalone ones.
+	'CREATE INDEX ... WITH NO DATA (partitioned)' => {
+		create_order => 102,
+		create_sql => '
+			CREATE TABLE dump_test.nodata_parted (a int, b text)
+				PARTITION BY RANGE (a);
+			CREATE TABLE dump_test.nodata_parted1 PARTITION OF
+				dump_test.nodata_parted FOR VALUES FROM (0) TO (100);
+			CREATE INDEX nodata_parted_deferred
+				ON dump_test.nodata_parted (a) WITH NO DATA;
+			CREATE INDEX nodata_parted_done
+				ON dump_test.nodata_parted (b) WITH NO DATA;
+			REINDEX INDEX dump_test.nodata_parted_done;
+			DO $$
+			DECLARE c regclass;
+			BEGIN
+				SELECT inhrelid::regclass INTO c FROM pg_inherits
+					WHERE inhparent = \'dump_test.nodata_parted_done\'::regclass;
+				EXECUTE format(
+					\'ALTER INDEX dump_test.nodata_parted_done ATTACH PARTITION %s\', c);
+			END $$;',
+		regexp => qr/^
+			\QCREATE INDEX nodata_parted_deferred ON ONLY dump_test.nodata_parted USING btree (a) WITH NO DATA;\E
+			/xm,
+		like => {
+			%full_runs, %dump_test_schema_runs, section_post_data => 1,
+		},
+		unlike => {
+			exclude_dump_test_schema => 1,
+			only_dump_measurement => 1,
+		},
+	},
+
+	# The converted tree: populated by REINDEX and revalidated by the
+	# re-attach, so it is dumped as an ordinary index with no trace of the
+	# clause it was created with.
+	'CREATE INDEX ... WITH NO DATA (partitioned, populated)' => {
+		regexp => qr/^
+			\QCREATE INDEX nodata_parted_done ON ONLY dump_test.nodata_parted USING btree (b);\E
+			/xm,
+		like => {
+			%full_runs, %dump_test_schema_runs, section_post_data => 1,
 		},
 		unlike => {
 			exclude_dump_test_schema => 1,

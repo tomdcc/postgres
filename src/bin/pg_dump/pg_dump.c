@@ -7913,6 +7913,18 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 	 */
 	if (fout->remoteVersion >= 110000)
 	{
+		/*
+		 * An index created WITH NO DATA has neither indisvalid nor
+		 * indisready, so it must bypass both conjuncts to be dumped at all.
+		 * Unlike an invalid index -- which is a crash artifact of unknown
+		 * provenance, and is deliberately omitted -- it is a definition the
+		 * user asked for, so it belongs in the dump.
+		 *
+		 * Require indislive along with it.  Bypassing indisvalid and
+		 * indisready removes what otherwise keeps a dead index out, and a
+		 * dead row must not be restored as a live definition however its drop
+		 * came to be interrupted.
+		 */
 		appendPQExpBuffer(query,
 						  "FROM unnest('%s'::pg_catalog.oid[]) AS src(tbloid)\n"
 						  "JOIN pg_catalog.pg_index i ON (src.tbloid = i.indrelid) "
@@ -7924,10 +7936,14 @@ getIndexes(Archive *fout, TableInfo tblinfo[], int numTables)
 						  "c.contype IN ('p','u','x')) "
 						  "LEFT JOIN pg_catalog.pg_inherits inh "
 						  "ON (inh.inhrelid = indexrelid) "
-						  "WHERE (i.indisvalid OR t2.relkind = 'p') "
-						  "AND i.indisready "
+						  "WHERE (i.indisvalid OR t2.relkind = 'p'%s) "
+						  "AND (i.indisready%s) "
 						  "ORDER BY i.indrelid, indexname",
-						  tbloids->data);
+						  tbloids->data,
+						  fout->remoteVersion >= 200000 ?
+						  " OR (i.indisnodata AND i.indislive)" : "",
+						  fout->remoteVersion >= 200000 ?
+						  " OR (i.indisnodata AND i.indislive)" : "");
 	}
 	else
 	{
@@ -18176,6 +18192,48 @@ getAttrName(int attrnum, const TableInfo *tblInfo)
 }
 
 /*
+ * appendIndexStatTargets
+ *	  append ALTER INDEX ... SET STATISTICS commands for the per-column
+ *	  statistics targets of an index (attstattarget), if any.
+ */
+static void
+appendIndexStatTargets(PQExpBuffer q, const IndxInfo *indxinfo)
+{
+	char	  **indstatcolsarray = NULL;
+	char	  **indstatvalsarray = NULL;
+	int			nstatcols = 0;
+	int			nstatvals = 0;
+
+	if (strlen(indxinfo->indstatcols) == 0 &&
+		strlen(indxinfo->indstatvals) == 0)
+		return;
+
+	if (!parsePGArray(indxinfo->indstatcols, &indstatcolsarray, &nstatcols))
+		pg_fatal("could not parse index statistic columns");
+	if (!parsePGArray(indxinfo->indstatvals, &indstatvalsarray, &nstatvals))
+		pg_fatal("could not parse index statistic values");
+	if (nstatcols != nstatvals)
+		pg_fatal("mismatched number of columns and values for index statistics");
+
+	for (int j = 0; j < nstatcols; j++)
+	{
+		appendPQExpBuffer(q, "ALTER INDEX %s ",
+						  fmtQualifiedDumpable(indxinfo));
+
+		/*
+		 * Note that this is a column number, so no quotes should be used.
+		 */
+		appendPQExpBuffer(q, "ALTER COLUMN %s ",
+						  indstatcolsarray[j]);
+		appendPQExpBuffer(q, "SET STATISTICS %s;\n",
+						  indstatvalsarray[j]);
+	}
+
+	free(indstatcolsarray);
+	free(indstatvalsarray);
+}
+
+/*
  * dumpIndex
  *	  write out to fout a user-defined index
  */
@@ -18209,13 +18267,6 @@ dumpIndex(Archive *fout, const IndxInfo *indxinfo)
 	 */
 	if (!is_constraint)
 	{
-		char	   *indstatcols = indxinfo->indstatcols;
-		char	   *indstatvals = indxinfo->indstatvals;
-		char	  **indstatcolsarray = NULL;
-		char	  **indstatvalsarray = NULL;
-		int			nstatcols = 0;
-		int			nstatvals = 0;
-
 		if (dopt->binary_upgrade)
 			binary_upgrade_set_pg_class_oids(fout, q,
 											 indxinfo->dobj.catId.oid);
@@ -18239,35 +18290,8 @@ dumpIndex(Archive *fout, const IndxInfo *indxinfo)
 							  qindxname);
 		}
 
-		/*
-		 * If the index has any statistics on some of its columns, generate
-		 * the associated ALTER INDEX queries.
-		 */
-		if (strlen(indstatcols) != 0 || strlen(indstatvals) != 0)
-		{
-			int			j;
-
-			if (!parsePGArray(indstatcols, &indstatcolsarray, &nstatcols))
-				pg_fatal("could not parse index statistic columns");
-			if (!parsePGArray(indstatvals, &indstatvalsarray, &nstatvals))
-				pg_fatal("could not parse index statistic values");
-			if (nstatcols != nstatvals)
-				pg_fatal("mismatched number of columns and values for index statistics");
-
-			for (j = 0; j < nstatcols; j++)
-			{
-				appendPQExpBuffer(q, "ALTER INDEX %s ", qqindxname);
-
-				/*
-				 * Note that this is a column number, so no quotes should be
-				 * used.
-				 */
-				appendPQExpBuffer(q, "ALTER COLUMN %s ",
-								  indstatcolsarray[j]);
-				appendPQExpBuffer(q, "SET STATISTICS %s;\n",
-								  indstatvalsarray[j]);
-			}
-		}
+		/* Per-column statistics targets, if any */
+		appendIndexStatTargets(q, indxinfo);
 
 		/* Indexes can depend on extensions */
 		append_depends_on_extension(fout, q, &indxinfo->dobj,
@@ -18306,9 +18330,6 @@ dumpIndex(Archive *fout, const IndxInfo *indxinfo)
 									  .section = SECTION_POST_DATA,
 									  .createStmt = q->data,
 									  .dropStmt = delq->data));
-
-		free(indstatcolsarray);
-		free(indstatvalsarray);
 	}
 
 	/* Dump Index Comments */
@@ -18859,6 +18880,9 @@ dumpConstraint(Archive *fout, const ConstraintInfo *coninfo)
 			appendPQExpBuffer(q, " ON %s;\n",
 							  fmtId(indxinfo->dobj.name));
 		}
+
+		/* Per-column statistics targets, if any */
+		appendIndexStatTargets(q, indxinfo);
 
 		/* If the index defines identity, we need to record that. */
 		if (indxinfo->indisreplident)

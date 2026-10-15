@@ -32,11 +32,13 @@
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "catalog/index.h"
+#include "catalog/objectaccess.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_proc.h"
 #include "commands/trigger.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
@@ -395,9 +397,12 @@ static bool ri_LockPKTuple(Relation pk_rel, TupleTableSlot *slot, Snapshot snap,
 static bool ri_fastpath_is_applicable(const RI_ConstraintInfo *riinfo);
 static bool ri_check_fastpath_index(RI_ConstraintInfo *riinfo,
 									Relation pk_rel, Relation idx_rel);
-static void ri_CheckPermissions(Relation query_rel);
+static void ri_CheckPermissions(const RI_ConstraintInfo *riinfo,
+								Relation query_rel);
 static bool recheck_matched_pk_tuple(Relation idxrel, ScanKeyData *skeys,
 									 int nkeys, TupleTableSlot *new_slot);
+static void ri_CheckFunctionPermissions(const RI_ConstraintInfo *riinfo,
+										const FastPathMeta *fpmeta);
 static void build_index_scankeys(const RI_ConstraintInfo *riinfo,
 								 FastPathMeta *fpmeta,
 								 Relation idx_rel, Datum *pk_vals,
@@ -2601,7 +2606,7 @@ get_ri_constraint_root(Oid constrOid)
 }
 
 /*
- * Callback for pg_constraint inval events
+ * Callback for pg_constraint and pg_amop inval events
  *
  * While most syscache callbacks just flush all their entries, pg_constraint
  * gets enough update traffic that it's probably worth being smarter.
@@ -2625,6 +2630,17 @@ InvalidateConstraintCacheCallBack(Datum arg, SysCacheIdentifier cacheid,
 	dlist_mutable_iter iter;
 
 	Assert(ri_constraint_cache != NULL);
+
+	/*
+	 * pg_amop changes can affect any constraint's fast-path metadata, and
+	 * this pg_amop hashvalue can't be matched against the pg_constraint-keyed
+	 * cache entries, so flush them all via the match-everything path below as
+	 * the large-list reset below does.  Being selective would mean mapping
+	 * the change back to the affected constraints, not worth it for DDL this
+	 * rare.
+	 */
+	if (cacheid == AMOPOPID)
+		hashvalue = 0;
 
 	/*
 	 * If the list of currently valid entries gets excessively large, we mark
@@ -2939,7 +2955,7 @@ ri_FastPathCheck(RI_ConstraintInfo *riinfo,
 						   saved_sec_context |
 						   SECURITY_LOCAL_USERID_CHANGE |
 						   SECURITY_NOFORCE_RLS);
-	ri_CheckPermissions(pk_rel);
+	ri_CheckPermissions(riinfo, pk_rel);
 
 	/*
 	 * Begin the scan under the switched user id, so that any access method
@@ -2947,7 +2963,7 @@ ri_FastPathCheck(RI_ConstraintInfo *riinfo,
 	 * btree this has no functional consequence, but it keeps the ordering
 	 * correct for out-of-tree access methods.
 	 */
-	scandesc = index_beginscan(pk_rel, idx_rel,
+	scandesc = index_beginscan(pk_rel, idx_rel, false,
 							   snapshot, NULL,
 							   riinfo->nkeys, 0,
 							   SO_NONE);
@@ -2959,6 +2975,7 @@ ri_FastPathCheck(RI_ConstraintInfo *riinfo,
 		ri_populate_fastpath_metadata(riinfo, fk_rel, idx_rel);
 	}
 	Assert(riinfo->fpmeta);
+	ri_CheckFunctionPermissions(riinfo, riinfo->fpmeta);
 	ri_ExtractValues(fk_rel, newslot, riinfo, false, pk_vals, pk_nulls);
 	build_index_scankeys(riinfo, riinfo->fpmeta, idx_rel, pk_vals, pk_nulls,
 						 skey);
@@ -3106,7 +3123,7 @@ ri_FastPathBatchFlush(RI_FastPathEntry *fpentry, Relation fk_rel,
 	 * albeit checked once per flush rather than once per row, like in
 	 * ri_FastPathCheck().
 	 */
-	ri_CheckPermissions(pk_rel);
+	ri_CheckPermissions(riinfo, pk_rel);
 
 	/*
 	 * Begin the scan under the switched user id, so that any access method
@@ -3114,7 +3131,7 @@ ri_FastPathBatchFlush(RI_FastPathEntry *fpentry, Relation fk_rel,
 	 * btree this has no functional consequence, but it keeps the ordering
 	 * correct for out-of-tree access methods.
 	 */
-	scandesc = index_beginscan(pk_rel, idx_rel, snapshot, NULL,
+	scandesc = index_beginscan(pk_rel, idx_rel, false, snapshot, NULL,
 							   riinfo->nkeys, 0, SO_NONE);
 
 	if (riinfo->fpmeta == NULL)
@@ -3322,7 +3339,7 @@ ri_FastPathFlushArray(RI_FastPathEntry *fpentry, TupleTableSlot *fk_slot,
 	 * Walk all matches.  The index AM returns them in index order.  For each
 	 * match, find which batch item(s) it satisfies.
 	 */
-	while (index_getnext_slot(scandesc, ForwardScanDirection, pk_slot))
+	while (table_index_getnext_slot(scandesc, ForwardScanDirection, pk_slot))
 	{
 		Datum		found_val;
 		bool		found_null;
@@ -3397,7 +3414,7 @@ ri_FastPathProbeOne(Relation pk_rel, Relation idx_rel,
 
 	index_rescan(scandesc, skey, nkeys, NULL, 0);
 
-	if (index_getnext_slot(scandesc, ForwardScanDirection, slot))
+	if (table_index_getnext_slot(scandesc, ForwardScanDirection, slot))
 	{
 		bool		concurrently_updated;
 
@@ -3566,19 +3583,53 @@ ri_check_fastpath_index(RI_ConstraintInfo *riinfo,
 		}
 	}
 
+	/*
+	 * The equality operator stored in pg_constraint must still be an equality
+	 * member of the index opfamily.  When it is not, the direct fast-path
+	 * probe errors, so mark the fast path unusable and fall back to SPI,
+	 * which uses the same operator in a query where the planner simply
+	 * declines the index.
+	 */
+	for (int i = 0; i < riinfo->nkeys; i++)
+	{
+		int			idx_col;
+
+		for (idx_col = 0; idx_col < idx_rel->rd_index->indnkeyatts; idx_col++)
+		{
+			if (idx_rel->rd_index->indkey.values[idx_col] ==
+				riinfo->pk_attnums[i])
+				break;
+		}
+		Assert(idx_col < idx_rel->rd_index->indnkeyatts);
+
+		if (get_op_opfamily_strategy(riinfo->pf_eq_oprs[i],
+									 idx_rel->rd_opfamily[idx_col]) != BTEqualStrategyNumber)
+		{
+			riinfo->fastpath_state = RI_FASTPATH_UNUSABLE;
+			return false;
+		}
+	}
+
 	riinfo->fastpath_state = RI_FASTPATH_USABLE;
 	return true;
 }
 
 /*
  * ri_CheckPermissions
- *   Check that the current user has permissions to look into the schema of
- *   and SELECT from 'query_rel'
+ *		Check permissions for the SELECT ... FOR KEY SHARE used by the SPI
+ *		path, as the referenced table's owner.
+ *
+ * Go through ExecCheckPermissions() with a manufactured range table so that
+ * ExecutorCheckPerms_hook gets control, as it does for the query the SPI
+ * path executes.
  */
 static void
-ri_CheckPermissions(Relation query_rel)
+ri_CheckPermissions(const RI_ConstraintInfo *riinfo, Relation query_rel)
 {
 	AclResult	aclresult;
+	AclMode		requiredPerms = ACL_SELECT | ACL_SELECT_FOR_UPDATE;
+	RangeTblEntry *rte;
+	RTEPermissionInfo *perminfo;
 
 	/* USAGE on schema. */
 	aclresult = object_aclcheck(NamespaceRelationId,
@@ -3588,12 +3639,29 @@ ri_CheckPermissions(Relation query_rel)
 		aclcheck_error(aclresult, OBJECT_SCHEMA,
 					   get_namespace_name(RelationGetNamespace(query_rel)));
 
-	/* SELECT on relation. */
-	aclresult = pg_class_aclcheck(RelationGetRelid(query_rel), GetUserId(),
-								  ACL_SELECT);
-	if (aclresult != ACLCHECK_OK)
-		aclcheck_error(aclresult, OBJECT_TABLE,
-					   RelationGetRelationName(query_rel));
+	/*
+	 * SELECT is needed only on the referenced key columns.  FOR KEY SHARE
+	 * also needs UPDATE privilege, which may be granted on any column; leave
+	 * updatedCols empty as the SPI query does.
+	 */
+	perminfo = makeNode(RTEPermissionInfo);
+	perminfo->relid = RelationGetRelid(query_rel);
+	perminfo->requiredPerms = requiredPerms;
+	for (int i = 0; i < riinfo->nkeys; i++)
+	{
+		int			attno = riinfo->pk_attnums[i] - FirstLowInvalidHeapAttributeNumber;
+
+		perminfo->selectedCols = bms_add_member(perminfo->selectedCols, attno);
+	}
+
+	rte = makeNode(RangeTblEntry);
+	rte->rtekind = RTE_RELATION;
+	rte->relid = RelationGetRelid(query_rel);
+	rte->relkind = query_rel->rd_rel->relkind;
+	rte->rellockmode = RowShareLock;
+	rte->perminfoindex = 1;
+
+	(void) ExecCheckPermissions(list_make1(rte), list_make1(perminfo), true);
 }
 
 /*
@@ -3650,6 +3718,41 @@ recheck_matched_pk_tuple(Relation idxrel, ScanKeyData *skeys, int nkeys,
 	}
 
 	return matched;
+}
+
+/*
+ * ri_CheckFunctionPermissions
+ *		Check EXECUTE privilege on the functions the fast path invokes on the
+ *		FK values, as the referenced table's owner.
+ *
+ * This parallels the checks ExecInitFunc() performs when the SPI path
+ * initializes its generated query, where the equality operator's function
+ * appears in the WHERE clause and the cast function, if any, in the cast
+ * applied to the parameter.  Call with the user id already switched to the
+ * referenced table's owner.
+ */
+static void
+ri_CheckFunctionPermissions(const RI_ConstraintInfo *riinfo,
+							const FastPathMeta *fpmeta)
+{
+	for (int i = 0; i < riinfo->nkeys; i++)
+	{
+		Oid			funcs[2] = {fpmeta->regops[i], fpmeta->cast_func_finfo[i].fn_oid};
+
+		for (int j = 0; j < lengthof(funcs); j++)
+		{
+			AclResult	aclresult;
+
+			if (!OidIsValid(funcs[j]))
+				continue;
+			aclresult = object_aclcheck(ProcedureRelationId, funcs[j],
+										GetUserId(), ACL_EXECUTE);
+			if (aclresult != ACLCHECK_OK)
+				aclcheck_error(aclresult, OBJECT_FUNCTION,
+							   get_func_name(funcs[j]));
+			InvokeFunctionExecuteHook(funcs[j]);
+		}
+	}
 }
 
 /*
@@ -4022,8 +4125,11 @@ ri_InitHashTables(void)
 									  RI_INIT_CONSTRAINTHASHSIZE,
 									  &ctl, HASH_ELEM | HASH_BLOBS);
 
-	/* Arrange to flush cache on pg_constraint changes */
+	/* Arrange to flush cache on pg_constraint or pg_amop changes */
 	CacheRegisterSyscacheCallback(CONSTROID,
+								  InvalidateConstraintCacheCallBack,
+								  (Datum) 0);
+	CacheRegisterSyscacheCallback(AMOPOPID,
 								  InvalidateConstraintCacheCallBack,
 								  (Datum) 0);
 

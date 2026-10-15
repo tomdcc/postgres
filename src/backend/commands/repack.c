@@ -114,6 +114,12 @@ typedef struct ChangeContext
 	EState	   *cc_estate;
 
 	/*
+	 * The tuple descriptor to deform decoded tuples with; it must have the
+	 * attmissingval values from the relation being repacked.
+	 */
+	TupleDesc	cc_tupdesc;
+
+	/*
 	 * Existing tuples to UPDATE and DELETE are located via this index. We
 	 * keep the scankey in partially initialized state to avoid repeated work.
 	 * sk_argument is completed on the fly.
@@ -159,6 +165,7 @@ static bool cluster_rel_recheck(RepackCommand cmd, Relation OldHeap,
 								int options);
 static void check_concurrent_repack_requirements(Relation rel,
 												 Oid *ident_idx_p);
+static void check_index_requirements(Relation rel, RepackCommand cmd);
 static void rebuild_relation(Relation OldHeap, Relation index, bool verbose,
 							 Oid ident_idx);
 static void copy_table_data(Relation NewHeap, Relation OldHeap, Relation OldIndex,
@@ -197,7 +204,8 @@ static void process_concurrent_changes(XLogRecPtr end_of_wal,
 									   ChangeContext *chgcxt,
 									   bool done);
 static void initialize_change_context(ChangeContext *chgcxt,
-									  Relation relation,
+									  Relation src_relation,
+									  Relation tgt_relation,
 									  Oid ident_index_id);
 static void release_change_context(ChangeContext *chgcxt);
 static void rebuild_relation_finish_concurrent(Relation NewHeap, Relation OldHeap,
@@ -216,6 +224,7 @@ static Oid	determine_clustered_index(Relation rel, bool usingindex,
 									  const char *indexname);
 
 static void start_repack_decoding_worker(Oid relid);
+static void wait_for_repack_decoding_worker(void);
 static void stop_repack_decoding_worker(void);
 static void stop_repack_decoding_worker_cb(int code, Datum arg);
 static Snapshot get_initial_snapshot(DecodingWorker *worker);
@@ -526,6 +535,24 @@ cluster_rel(RepackCommand cmd, Relation OldHeap, Oid indexOid,
 	 */
 	if (concurrent)
 		check_concurrent_repack_requirements(OldHeap, &ident_idx);
+
+	/*
+	 * In concurrent mode, also lock the toast table.  Otherwise it would be
+	 * possible for the toast relfilenode to change (e.g. because VACUUM FULL
+	 * or REPACK is run on it).  This would break concurrent repack's system
+	 * for skipping decoding changes in other tables -- see
+	 * change_useless_for_repack().
+	 */
+	if (concurrent && OidIsValid(OldHeap->rd_rel->reltoastrelid))
+		LockRelationOid(OldHeap->rd_rel->reltoastrelid, lmode);
+
+	/*
+	 * Also check the state of indexes; this can abort the command for REPACK.
+	 * Historically this hasn't affected CLUSTER or VACUUM FULL, so don't do
+	 * it for those commands.
+	 */
+	if (cmd == REPACK_COMMAND_REPACK)
+		check_index_requirements(OldHeap, cmd);
 
 	/* Check for user-requested abort. */
 	CHECK_FOR_INTERRUPTS();
@@ -875,6 +902,76 @@ mark_index_clustered(Relation rel, Oid indexOid, bool is_internal)
 }
 
 /*
+ * check_index_requirements: verify index state on relation being processed
+ *
+ * Throw an error if any incompletely-built indexes are found.
+ *
+ * Indexes that are not ready for inserts, such as ones left behind by failed
+ * CREATE INDEX CONCURRENTLY, are not maintained by DML.  Indexes that aren't
+ * marked valid could have been in the middle of validation when their build
+ * failed, and thus it's not certain that they could be built.  In both cases,
+ * attempting to rebuild may fail altogether.  Throwing an error here forces
+ * the user to take action on these indexes separately from the table
+ * reconstruction, which prevents perpetuating them for no reason.
+ *
+ * An index created WITH NO DATA is exempt.  It is invalid by request rather
+ * than by accident, and the rewrite does not rebuild it at all: the exclusive
+ * path skips it in reindex_relation() and the concurrent path leaves it out of
+ * the copies it builds, so nothing here can fail on its account.  The test is
+ * on indisnodata rather than a weaker test of validity, so that the leftovers
+ * this check exists to catch are still caught.
+ */
+static void
+check_index_requirements(Relation rel, RepackCommand cmd)
+{
+	Relation	indrel;
+	SysScanDesc indscan;
+	ScanKeyData skey;
+	HeapTuple	htup;
+	int			num_invalid_idxs = 0;
+	StringInfoData dest;
+
+	initStringInfo(&dest);
+
+	/* Prepare to scan pg_index for entries having indrelid = this rel. */
+	ScanKeyInit(&skey,
+				Anum_pg_index_indrelid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(RelationGetRelid(rel)));
+
+	indrel = table_open(IndexRelationId, AccessShareLock);
+	indscan = systable_beginscan(indrel, IndexIndrelidIndexId, true,
+								 NULL, 1, &skey);
+
+	while (HeapTupleIsValid(htup = systable_getnext(indscan)))
+	{
+		Form_pg_index index = (Form_pg_index) GETSTRUCT(htup);
+
+		if (!index->indisvalid && !index->indisnodata)
+		{
+			if (num_invalid_idxs == 0)
+				appendStringInfo(&dest, _("\"%s\""), get_rel_name(index->indexrelid));
+			else
+				appendStringInfo(&dest, _(", \"%s\""), get_rel_name(index->indexrelid));
+			num_invalid_idxs++;
+		}
+	}
+	systable_endscan(indscan);
+	table_close(indrel, AccessShareLock);
+
+	if (num_invalid_idxs > 0)
+		ereport(ERROR,
+				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				errmsg("cannot execute %s on relation \"%s\"",
+					   RepackCommandAsString(cmd), RelationGetRelationName(rel)),
+				errdetail_plural("An invalid index cannot be processed correctly: %s.",
+								 "Some invalid indexes cannot be processed correctly: %s.",
+								 num_invalid_idxs,
+								 dest.data),
+				errhint("Use DROP INDEX or REINDEX."));
+}
+
+/*
  * Check if the CONCURRENTLY option is legal for the relation.
  *
  * *Ident_idx_p receives OID of the identity index.
@@ -1057,16 +1154,22 @@ rebuild_relation(Relation OldHeap, Relation index, bool verbose,
 		BecomeLockGroupLeader();
 
 		/*
+		 * If there is a toast table, it must have been locked already.
+		 * Otherwise we risk it changing underneath us (catastrophic).
+		 */
+		Assert(!OidIsValid(OldHeap->rd_rel->reltoastrelid) ||
+			   CheckRelationOidLockedByMe(OldHeap->rd_rel->reltoastrelid,
+										  lmode, false));
+
+		/*
 		 * Start the worker that decodes data changes applied while we're
 		 * copying the table contents.
 		 *
 		 * Note that the worker has to wait for all transactions with XID
 		 * already assigned to finish. If some of those transactions is
 		 * waiting for a lock conflicting with ShareUpdateExclusiveLock on our
-		 * table (e.g.  it runs CREATE INDEX), we can end up in a deadlock.
-		 * Not sure this risk is worth unlocking/locking the table (and its
-		 * clustering index) and checking again if it's still eligible for
-		 * REPACK CONCURRENTLY.
+		 * table or its TOAST relation (e.g. it runs CREATE INDEX), we can end
+		 * up in a deadlock.
 		 */
 		start_repack_decoding_worker(tableOid);
 
@@ -1351,9 +1454,17 @@ copy_table_data(Relation NewHeap, Relation OldHeap, Relation OldIndex,
 	 *
 	 * We don't need to open the toast relation here, just lock it.  The lock
 	 * will be held till end of transaction.
+	 *
+	 * Concurrent repack must hold this lock already; see cluster_rel().
 	 */
 	if (OldHeap->rd_rel->reltoastrelid)
-		LockRelationOid(OldHeap->rd_rel->reltoastrelid, lmode);
+	{
+		if (!concurrent)
+			LockRelationOid(OldHeap->rd_rel->reltoastrelid, lmode);
+		else
+			Assert(CheckRelationOidLockedByMe(OldHeap->rd_rel->reltoastrelid,
+											  lmode, false));
+	}
 
 	/*
 	 * If both tables have TOAST tables, perform toast swap by content.  It is
@@ -2615,12 +2726,26 @@ apply_concurrent_changes(BufFile *file, ChangeContext *chgcxt)
 	bool		have_old_tuple = false;
 	MemoryContext oldcxt;
 
-	spilled_tuple = MakeSingleTupleTableSlot(RelationGetDescr(rel),
-											 &TTSOpsVirtual);
+	/*
+	 * Set up the tuple table slots for the operations.
+	 *
+	 * spilled_tuple is a tuple we read from the file spilled by the decoding
+	 * worker.  It must be read using the tuple descriptor of the original
+	 * relation, because it may contain attributes with 'attmissingval'.
+	 *
+	 * old_update_tuple is an update's OLD tuple to extract the tuple's key
+	 * from, read from the spill file, so we also use the original rel's
+	 * tupdesc.  (XXX Many places aren't prepared for that tupdesc's attribute
+	 * layout to differ from the transient rel's tupdesc.)
+	 *
+	 * ondisk_tuple is the tuple in the transient relation for UPDATEs and
+	 * DELETEs, as obtained by searching by replication identity.  It uses
+	 * tupdesc and tuptable ops appropriate for the transient relation.
+	 */
+	spilled_tuple = MakeSingleTupleTableSlot(chgcxt->cc_tupdesc, &TTSOpsVirtual);
+	old_update_tuple = MakeSingleTupleTableSlot(chgcxt->cc_tupdesc, &TTSOpsVirtual);
 	ondisk_tuple = MakeSingleTupleTableSlot(RelationGetDescr(rel),
 											table_slot_callbacks(rel));
-	old_update_tuple = MakeSingleTupleTableSlot(RelationGetDescr(rel),
-												&TTSOpsVirtual);
 
 	oldcxt = MemoryContextSwitchTo(GetPerTupleMemoryContext(chgcxt->cc_estate));
 
@@ -2960,10 +3085,10 @@ find_target_tuple(Relation rel, ChangeContext *chgcxt, TupleTableSlot *locator,
 	}
 
 	/* XXX no instrumentation for now */
-	scan = index_beginscan(rel, chgcxt->cc_ident_index, GetActiveSnapshot(),
+	scan = index_beginscan(rel, chgcxt->cc_ident_index, false, GetActiveSnapshot(),
 						   NULL, chgcxt->cc_ident_key_nentries, 0, 0);
 	index_rescan(scan, chgcxt->cc_ident_key, chgcxt->cc_ident_key_nentries, NULL, 0);
-	while (index_getnext_slot(scan, ForwardScanDirection, retrieved))
+	while (table_index_getnext_slot(scan, ForwardScanDirection, retrieved))
 	{
 		/* Be wary of temporal constraints */
 		if (scan->xs_recheck && !identity_key_equal(chgcxt, locator, retrieved))
@@ -3078,14 +3203,24 @@ process_concurrent_changes(XLogRecPtr end_of_wal, ChangeContext *chgcxt, bool do
 }
 
 /*
- * Initialize the ChangeContext struct for the given relation, with
- * the given index as identity index.
+ * Initialize ChangeContext to propagate changes of src_relation (the relation
+ * being repacked) into tgt_relation (the transient relation), using the given
+ * index (on tgt_relation) as identity.
  */
 static void
 initialize_change_context(ChangeContext *chgcxt,
-						  Relation relation, Oid ident_index_id)
+						  Relation src_relation, Relation tgt_relation,
+						  Oid ident_index_id)
 {
-	chgcxt->cc_rel = relation;
+	chgcxt->cc_rel = tgt_relation;
+
+	/*
+	 * Use the descriptor of the source relation as the one to deform the
+	 * decoded tuples with; in particular, this descriptor contains all the
+	 * missing attributes.  Tuples formed with it are also valid for the
+	 * transient relation, as the attributes are otherwise identical.
+	 */
+	chgcxt->cc_tupdesc = RelationGetDescr(src_relation);
 
 	/* Only initialize fields needed by ExecInsertIndexTuples(). */
 	chgcxt->cc_estate = CreateExecutorState();
@@ -3096,7 +3231,7 @@ initialize_change_context(ChangeContext *chgcxt,
 	 */
 	{
 		RangeTblEntry *rte;
-		TupleDesc	desc = RelationGetDescr(relation);
+		TupleDesc	desc = RelationGetDescr(tgt_relation);
 		List	   *perminfos = NIL;
 		Bitmapset  *updatedCols = NULL;
 		RTEPermissionInfo *perminfo;
@@ -3108,8 +3243,8 @@ initialize_change_context(ChangeContext *chgcxt,
 		 */
 		rte = makeNode(RangeTblEntry);
 		rte->rtekind = RTE_RELATION;
-		rte->relid = RelationGetRelid(relation);
-		rte->relkind = RelationGetForm(relation)->relkind;
+		rte->relid = RelationGetRelid(tgt_relation);
+		rte->relkind = RelationGetForm(tgt_relation)->relkind;
 		/* Create the RTEPermissionInfo instance (and set ->perminfoindex). */
 		addRTEPermissionInfo(&perminfos, rte);
 
@@ -3143,7 +3278,7 @@ initialize_change_context(ChangeContext *chgcxt,
 
 	/* Set up our ResultRelInfo to use for index updates */
 	chgcxt->cc_rri = makeNode(ResultRelInfo);
-	InitResultRelInfo(chgcxt->cc_rri, relation, 1, NULL, 0);
+	InitResultRelInfo(chgcxt->cc_rri, tgt_relation, 1, NULL, 0);
 	ExecOpenIndices(chgcxt->cc_rri, false);
 
 	/*
@@ -3265,6 +3400,29 @@ rebuild_relation_finish_concurrent(Relation NewHeap, Relation OldHeap,
 	Assert(CheckRelationLockedByMe(NewHeap, AccessExclusiveLock, false));
 
 	/*
+	 * Leave any index created WITH NO DATA out of the rebuild.  It holds no
+	 * entries, so it refers to none of the tuple identifiers the new heap
+	 * invalidates, and its storage stays correct untouched.  Building a copy
+	 * would populate an index the user deferred, which is the one thing the
+	 * clause promises not to do.
+	 *
+	 * The non-concurrent path does not merely skip such an index: it gives it
+	 * fresh storage of the new heap's persistence, because finish_heap_swap()
+	 * may be changing that persistence.  Nothing here can, since
+	 * check_concurrent_repack_requirements() accepts permanent relations
+	 * only, so the index's existing storage is already persisted correctly.
+	 *
+	 * Drop it here rather than in build_new_indexes(), because that
+	 * function's result is matched to this list by position when the index
+	 * storage is swapped below.
+	 */
+	foreach_oid(indoid, ind_oids_old)
+	{
+		if (get_index_isnodata(indoid))
+			ind_oids_old = foreach_delete_current(ind_oids_old, indoid);
+	}
+
+	/*
 	 * Unlike the exclusive case, we build new indexes for the new relation
 	 * rather than swapping the storage and reindexing the old relation. The
 	 * point is that the index build can take some time, so we do it before we
@@ -3304,7 +3462,7 @@ rebuild_relation_finish_concurrent(Relation NewHeap, Relation OldHeap,
 			 get_rel_name(identIdx));
 
 	/* Gather information to apply concurrent changes. */
-	initialize_change_context(&chgcxt, NewHeap, ident_idx_new);
+	initialize_change_context(&chgcxt, OldHeap, NewHeap, ident_idx_new);
 
 	/*
 	 * During testing, wait for another backend to perform concurrent data
@@ -3487,6 +3645,8 @@ build_new_indexes(Relation NewHeap, Relation OldHeap, List *OldIndexes)
 		result = lappend_oid(result, newindex);
 
 		index_close(ind, NoLock);
+
+		pgstat_progress_incr_param(PROGRESS_REPACK_INDEX_REBUILD_COUNT, 1);
 	}
 
 	return result;
@@ -3694,9 +3854,12 @@ start_repack_decoding_worker(Oid relid)
 	shared->roleid = GetUserId();
 	shared->relid = relid;
 	ConditionVariableInit(&shared->cv);
-	shared->backend_proc = MyProc;
 	shared->backend_pid = MyProcPid;
 	shared->backend_proc_number = MyProcNumber;
+
+	/* Transmit our timeouts to the worker too */
+	shared->lock_timeout = LockTimeout;
+	shared->transaction_timeout = TransactionTimeout;
 
 	mq = shm_mq_create((char *) BUFFERALIGN(shared->error_queue),
 					   REPACK_ERROR_QUEUE_SIZE);
@@ -3725,6 +3888,19 @@ start_repack_decoding_worker(Oid relid)
 				errhint("You might need to increase \"%s\".", "max_worker_processes"));
 
 	/*
+	 * Now that the worker is registered, connect the error message queue to
+	 * it.
+	 */
+	shm_mq_set_handle(decoding_worker->error_mqh, decoding_worker->handle);
+
+	/*
+	 * Make sure the worker has started before we wait for it to initialize
+	 * decoding below, so that the failure-to-start case does not hang
+	 * forever.
+	 */
+	wait_for_repack_decoding_worker();
+
+	/*
 	 * The decoding setup must be done before the caller can have XID assigned
 	 * for any reason, otherwise the worker might end up in a deadlock,
 	 * waiting for the caller's transaction to end. Therefore wait here until
@@ -3748,6 +3924,74 @@ start_repack_decoding_worker(Oid relid)
 }
 
 /*
+ * Wait for the decoding worker to start up, and throw an error if it fails
+ * to do so.
+ *
+ * This is similar to WaitForParallelWorkersToAttach(). The only reliable way
+ * to tell a worker that failed to start (fork failure, or an exit before it
+ * attached) from one that is merely slow is to check whether it became the
+ * sender on the error message queue. If it stopped without attaching, nothing
+ * was queued and we report the generic failure ourselves. If it attached, any
+ * error it reported is in the queue and is thrown when we process pending
+ * messages, either here or later while we wait for it to initialize decoding.
+ */
+static void
+wait_for_repack_decoding_worker(void)
+{
+	for (;;)
+	{
+		BgwHandleStatus status;
+		shm_mq	   *mq;
+		int			rc;
+		pid_t		pid;
+
+		/*
+		 * This will process any repack messages that are pending and it may
+		 * also throw an error propagated from a worker.
+		 */
+		CHECK_FOR_INTERRUPTS();
+
+		/* If error_mqh is NULL, the worker has exited cleanly */
+		if (decoding_worker->error_mqh == NULL)
+			break;
+
+		status = GetBackgroundWorkerPid(decoding_worker->handle, &pid);
+		if (status == BGWH_STARTED)
+		{
+			/* Has the worker attached to the error message queue? */
+			mq = shm_mq_get_queue(decoding_worker->error_mqh);
+			if (shm_mq_get_sender(mq) != NULL)
+				break;
+		}
+		else if (status == BGWH_STOPPED)
+		{
+			/*
+			 * If the worker stopped without attaching to the error message
+			 * queue, throw an error. Otherwise, assume it attached and
+			 * reported an error before exiting, so mark it attached and let
+			 * the next attempt to process pending messages, here or later
+			 * while the initial snapshot is set up, throw that error.
+			 */
+			mq = shm_mq_get_queue(decoding_worker->error_mqh);
+			if (shm_mq_get_sender(mq) == NULL)
+				ereport(ERROR,
+						errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("REPACK decoding worker failed to start"),
+						errhint("More details may be available in the server log."));
+			break;
+		}
+
+		/* Worker neither started or stopped yet, so wait. */
+		rc = WaitLatch(MyLatch,
+					   WL_LATCH_SET | WL_EXIT_ON_PM_DEATH,
+					   -1, WAIT_EVENT_BGWORKER_STARTUP);
+
+		if (rc & WL_LATCH_SET)
+			ResetLatch(MyLatch);
+	}
+}
+
+/*
  * Stop the decoding worker and cleanup the related resources.
  *
  * The worker stops on its own when it knows there is no more work to do, but
@@ -3760,13 +4004,36 @@ stop_repack_decoding_worker(void)
 	if (decoding_worker == NULL)
 		return;
 
-	/* Terminate the worker process, if one is running. */
+	/* Terminate the decoding worker, if one is running */
+	if (decoding_worker->handle != NULL)
+		TerminateBackgroundWorker(decoding_worker->handle);
+
+	/*
+	 * The error queue should have already been nulled out during worker
+	 * shutdown, but if that didn't happen, do it now.
+	 */
+	if (decoding_worker->error_mqh != NULL)
+	{
+		shm_mq_detach(decoding_worker->error_mqh);
+		decoding_worker->error_mqh = NULL;
+	}
+
+	/*
+	 * Cancel any sleep on the condition variable before detaching the shared
+	 * memory segment, because the CV lives in that segment.  Otherwise later
+	 * cleanup would touch freed memory.
+	 */
+	ConditionVariableCancelSleep();
+
+	/*
+	 * We can't finish the REPACK command until the worker has exited.  This
+	 * means, in particular, that we can't respond to interrupts at this
+	 * stage.
+	 */
 	if (decoding_worker->handle != NULL)
 	{
 		BgwHandleStatus status;
 
-		TerminateBackgroundWorker(decoding_worker->handle);
-		/* The worker should really exit before the REPACK command does. */
 		HOLD_INTERRUPTS();
 		status = WaitForBackgroundWorkerShutdown(decoding_worker->handle);
 		RESUME_INTERRUPTS();
@@ -3778,21 +4045,17 @@ stop_repack_decoding_worker(void)
 	}
 
 	/*
-	 * Now detach from our shared memory segment.  In error cases there might
-	 * still be messages from the worker in the queue, which ProcessInterrupts
-	 * would try to read; this is pointless (and causes an assertion failure),
-	 * so set the global pointer to NULL to have ProcessRepackMessages ignore
-	 * them.
-	 *
-	 * We must also cancel the current sleep, if one is still set up.  This is
-	 * critical because the CV lives in the DSM that we're about to detach, so
-	 * if we omit it, later automatic cleanup tries to clear freed memory.
+	 * Detach from the shared memory segment only now that the worker is gone.
+	 * The worker attaches to the shared file set after it maps the segment,
+	 * so detaching any earlier can destroy the file set under a worker that
+	 * is still starting up.
 	 */
-	if (decoding_worker->error_mqh != NULL)
-		shm_mq_detach(decoding_worker->error_mqh);
-	ConditionVariableCancelSleep();
 	if (decoding_worker->seg != NULL)
+	{
 		dsm_detach(decoding_worker->seg);
+		decoding_worker->seg = NULL;
+	}
+
 	pfree(decoding_worker);
 	decoding_worker = NULL;
 }
@@ -3897,9 +4160,11 @@ ProcessRepackMessages(void)
 
 	/*
 	 * Nothing to do if we haven't launched the worker yet or have already
-	 * terminated it.
+	 * terminated it. Stopping the worker detaches the error message queue
+	 * before clearing decoding_worker, so also bail out once error_mqh is
+	 * gone.
 	 */
-	if (decoding_worker == NULL)
+	if (decoding_worker == NULL || decoding_worker->error_mqh == NULL)
 		return;
 
 	/*
@@ -3929,40 +4194,49 @@ ProcessRepackMessages(void)
 	RepackMessagePending = false;
 
 	/*
-	 * Read as many messages as we can from the worker, but stop when no more
-	 * messages can be read from the worker without blocking.
+	 * Read messages from the worker, but stop if the error queue disappears,
+	 * which happens when a PqRepackMsg_Terminate is received; or as soon as
+	 * no more messages can be read without blocking.  Messages are
+	 * infrequent, so no point optimizing stringinfo allocation.
 	 */
-	while (true)
+	while (decoding_worker->error_mqh != NULL)
 	{
 		shm_mq_result res;
 		Size		nbytes;
 		void	   *data;
+		StringInfoData msg;
 
 		res = shm_mq_receive(decoding_worker->error_mqh, &nbytes,
 							 &data, true);
-		if (res == SHM_MQ_WOULD_BLOCK)
-			break;
-		else if (res == SHM_MQ_SUCCESS)
+		switch (res)
 		{
-			StringInfoData msg;
+			case SHM_MQ_SUCCESS:
+				initStringInfo(&msg);
+				appendBinaryStringInfo(&msg, data, nbytes);
+				ProcessRepackMessage(&msg);
+				pfree(msg.data);
+				break;
 
-			initStringInfo(&msg);
-			appendBinaryStringInfo(&msg, data, nbytes);
-			ProcessRepackMessage(&msg);
-			pfree(msg.data);
-		}
-		else
-		{
-			/*
-			 * The decoding worker is special in that it exits as soon as it
-			 * has its work done. Thus the DETACHED result code is fine.
-			 */
-			Assert(res == SHM_MQ_DETACHED);
+			case SHM_MQ_WOULD_BLOCK:
+				/* no more messages to process for now */
+				goto out;
 
-			break;
+			case SHM_MQ_DETACHED:
+
+				/*
+				 * Normal worker stop sends a Terminate message, causing
+				 * ProcessRepackMessage to set error_mqh to NULL, thus exiting
+				 * this loop; so this case should never happen.  If it does,
+				 * the worker terminated abnormally, so report that.
+				 */
+				ereport(ERROR,
+						errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("lost connection to REPACK decoding worker"),
+						errhint("More details may be available in the server log."));
 		}
 	}
 
+out:
 	MemoryContextSwitchTo(oldcontext);
 
 	/* Might as well clear the context on our way out */
@@ -3972,7 +4246,7 @@ ProcessRepackMessages(void)
 }
 
 /*
- * Process a single protocol message received from a single parallel worker.
+ * Process a single protocol message received from a repack worker.
  */
 static void
 ProcessRepackMessage(StringInfo msg)
@@ -4011,10 +4285,18 @@ ProcessRepackMessage(StringInfo msg)
 				break;
 			}
 
+		case PqRepackMsg_Terminate:
+
+			/*
+			 * The worker has completed its work; stop watching its message
+			 * queue now for orderly shutdown.
+			 */
+			shm_mq_detach(decoding_worker->error_mqh);
+			decoding_worker->error_mqh = NULL;
+			break;
+
 		default:
-			{
-				elog(ERROR, "unrecognized message type received from decoding worker: %c (message length %d bytes)",
-					 msgtype, msg->len);
-			}
+			elog(ERROR, "unrecognized message type received from decoding worker: %c (message length %d bytes)",
+				 msgtype, msg->len);
 	}
 }

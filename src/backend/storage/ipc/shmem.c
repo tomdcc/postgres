@@ -131,6 +131,7 @@
 #include <unistd.h>
 
 #include "access/slru.h"
+#include "common/int.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -347,32 +348,26 @@ ShmemRequestInternal(ShmemStructOpts *options, ShmemRequestKind kind)
 	MemoryContext oldcontext;
 	ShmemRequest *request;
 
+	/* Check that we're in the right state */
+	if (shmem_request_state != SRS_REQUESTING)
+		elog(ERROR, "ShmemRequestStruct can only be called from a shmem_request callback");
+
 	/* Check the options */
 	if (options->name == NULL)
 		elog(ERROR, "shared memory request is missing 'name' option");
 
-	if (IsUnderPostmaster)
+	if (options->size == SHMEM_ATTACH_UNKNOWN_SIZE)
 	{
-		if (options->size <= 0 && options->size != SHMEM_ATTACH_UNKNOWN_SIZE)
-			elog(ERROR, "invalid size %zd for shared memory request for \"%s\"",
-				 options->size, options->name);
-	}
-	else
-	{
-		if (options->size == SHMEM_ATTACH_UNKNOWN_SIZE)
+		if (ShmemIndex == NULL)
 			elog(ERROR, "SHMEM_ATTACH_UNKNOWN_SIZE cannot be used during startup");
-		if (options->size <= 0)
-			elog(ERROR, "invalid size %zd for shared memory request for \"%s\"",
-				 options->size, options->name);
 	}
+	else if (options->size <= 0)
+		elog(ERROR, "invalid size %zd for shared memory request for \"%s\"",
+			 options->size, options->name);
 
 	if (options->alignment != 0 && pg_nextpower2_size_t(options->alignment) != options->alignment)
 		elog(ERROR, "invalid alignment %zu for shared memory request for \"%s\"",
 			 options->alignment, options->name);
-
-	/* Check that we're in the right state */
-	if (shmem_request_state != SRS_REQUESTING)
-		elog(ERROR, "ShmemRequestStruct can only be called from a shmem_request callback");
 
 	/* Check that it's not already registered in this process */
 	foreach_ptr(ShmemRequest, existing, pending_shmem_requests)
@@ -534,6 +529,9 @@ InitShmemIndexEntry(ShmemRequest *request)
 	bool		found;
 	size_t		allocated_size;
 	void	   *structPtr;
+
+	/* Size must be known at this point. */
+	Assert(request->options->size != SHMEM_ATTACH_UNKNOWN_SIZE);
 
 	/* look it up in the shmem index */
 	index_entry = (ShmemIndexEnt *)
@@ -786,6 +784,8 @@ void
 ResetShmemAllocator(void)
 {
 	Assert(!IsUnderPostmaster);
+	ShmemAllocator = NULL;
+	ShmemIndex = NULL;
 	shmem_request_state = SRS_INITIAL;
 
 	pending_shmem_requests = NIL;
@@ -836,6 +836,8 @@ ShmemAllocNoError(Size size)
  *
  * Also sets *allocated_size to the number of bytes allocated, which will
  * be equal to the number requested plus any padding we choose to add.
+ *
+ * Returns NULL in case space can not be allocated.
  */
 static void *
 ShmemAllocRaw(Size size, Size alignment, Size *allocated_size)
@@ -866,8 +868,13 @@ ShmemAllocRaw(Size size, Size alignment, Size *allocated_size)
 	rawStart = ShmemAllocator->free_offset;
 	newStart = TYPEALIGN(alignment, rawStart);
 
-	newFree = newStart + size;
-	if (newFree <= ShmemSegHdr->totalsize)
+	/*
+	 * newFree = newStart + size, which is the start of the remaining space
+	 * after the allocation.  If it exceeds the shmem segment size, we don't
+	 * have enough space available.
+	 */
+	if (!pg_add_size_overflow(newStart, size, &newFree) &&
+		newFree <= ShmemSegHdr->totalsize)
 	{
 		newSpace = (char *) ShmemBase + newStart;
 		ShmemAllocator->free_offset = newFree;
@@ -1024,7 +1031,14 @@ ProcessShmemRequestsAfterStartup(const ShmemCallbacks *callbacks)
 			found_any = true;
 		}
 		else
+		{
+			if (request->options->size == SHMEM_ATTACH_UNKNOWN_SIZE)
+				ereport(ERROR,
+						(errmsg("cannot attach to shared memory struct \"%s\" because it does not exist",
+								request->options->name),
+						 errdetail("SHMEM_ATTACH_UNKNOWN_SIZE can only be used to attach to an existing shared memory structure.")));
 			notfound_any = true;
+		}
 	}
 	if (found_any && notfound_any)
 		elog(ERROR, "some of the requested shmem areas have already been initialized");
@@ -1113,12 +1127,8 @@ ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 
 	LWLockAcquire(ShmemIndexLock, LW_EXCLUSIVE);
 
-	/*
-	 * During postmaster startup, look up the existing entry if any.
-	 */
-	*foundPtr = false;
-	if (IsUnderPostmaster)
-		*foundPtr = AttachShmemIndexEntry(&request, true);
+	/* Look up the existing entry if any */
+	*foundPtr = AttachShmemIndexEntry(&request, true);
 
 	/* Initialize it if not found */
 	if (!*foundPtr)
@@ -1210,7 +1220,9 @@ pg_get_shmem_allocations_numa(PG_FUNCTION_ARGS)
 	Size	   *nodes;
 
 	if (pg_numa_init() == -1)
-		elog(ERROR, "libnuma initialization failed or NUMA is not supported on this platform");
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("libnuma initialization failed or NUMA is not supported on this platform")));
 
 	InitMaterializedSRF(fcinfo, 0);
 
@@ -1360,7 +1372,7 @@ pg_get_shmem_allocations_numa(PG_FUNCTION_ARGS)
  * If the shared segment was allocated using huge pages, returns the size of
  * a huge page. Otherwise returns the size of regular memory page.
  *
- * This should be used only after the server is started.
+ * This should be used only after shared memory has been initialized.
  */
 Size
 pg_get_shmem_pagesize(void)
@@ -1375,7 +1387,6 @@ pg_get_shmem_pagesize(void)
 	os_page_size = sysconf(_SC_PAGESIZE);
 #endif
 
-	Assert(IsUnderPostmaster);
 	Assert(huge_pages_status != HUGE_PAGES_UNKNOWN);
 
 	if (huge_pages_status == HUGE_PAGES_ON)

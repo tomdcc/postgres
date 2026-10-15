@@ -495,6 +495,13 @@ VACUUM [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] [ <re
     <xref linkend="vacuum-progress-reporting"/> and
     <xref linkend="cluster-progress-reporting"/> for details.
    </para>
+
+   <para>
+    This command does not populate an index created with
+    <link linkend="sql-createindex-with-no-data"><command>CREATE INDEX ... WITH
+    NO DATA</command></link>.  Such an index stays unpopulated until a
+    <command>REINDEX</command> naming it explicitly builds it.
+   </para>
  </refsect1>
 
  <refsect1>

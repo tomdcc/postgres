@@ -62,7 +62,13 @@ check_publication_add_relation(PublicationRelInfo *pri)
 
 	if (pri->except)
 	{
-		relname = RelationGetQualifiedRelationName(targetrel);
+		/*
+		 * The name parts must not be quoted here, because the message already
+		 * encloses the whole name in double quotes.
+		 */
+		relname = psprintf("%s.%s",
+						   get_namespace_name(RelationGetNamespace(targetrel)),
+						   RelationGetRelationName(targetrel));
 		errormsg = gettext_noop("cannot specify relation \"%s\" in the publication EXCEPT clause");
 	}
 	else
@@ -935,6 +941,25 @@ List *
 GetRelationExcludedPublications(Oid relid)
 {
 	return get_relation_publications(relid, true);
+}
+
+/*
+ * Check whether the relation is referenced by any publication, either as a
+ * published relation or in a publication's EXCEPT clause.
+ */
+bool
+RelationHasPublication(Oid relid)
+{
+	CatCList   *pubrellist;
+	bool		found;
+
+	pubrellist = SearchSysCacheList1(PUBLICATIONRELMAP,
+									 ObjectIdGetDatum(relid));
+	found = (pubrellist->n_members > 0);
+
+	ReleaseSysCacheList(pubrellist);
+
+	return found;
 }
 
 /*

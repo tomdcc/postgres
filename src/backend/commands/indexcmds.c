@@ -632,6 +632,28 @@ DefineIndex(ParseState *pstate,
 		concurrent = false;
 
 	/*
+	 * CONCURRENTLY and WITH NO DATA are contradictory: the former exists to
+	 * build the index without blocking writers, the latter to not build it at
+	 * all.  Accepting both would mean silently ignoring one of them.
+	 *
+	 * Note we test stmt->concurrent rather than 'concurrent', so that the
+	 * error is thrown for temporary tables too, where CONCURRENTLY is
+	 * downgraded above.  Being consistent seems better than accepting the
+	 * combination in one place and rejecting it in another.
+	 */
+	if (stmt->concurrent && stmt->nodata)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot create index CONCURRENTLY WITH NO DATA"),
+				 errhint("Use REINDEX INDEX CONCURRENTLY to populate the index later.")));
+
+	/* Constraint DDL has no way to spell the clause. */
+	if (stmt->nodata && stmt->isconstraint)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("constraint indexes cannot be created WITH NO DATA")));
+
+	/*
 	 * Start progress report.  If we're building a partition, this was already
 	 * done.
 	 */
@@ -682,6 +704,14 @@ DefineIndex(ParseState *pstate,
 	 * index build; but for concurrent builds we allow INSERT/UPDATE/DELETE
 	 * (but not VACUUM).
 	 *
+	 * WITH NO DATA builds nothing, and the index it leaves behind holds no
+	 * entries and is not maintained, so there is nothing a concurrent writer
+	 * could do that the index would miss.  Take the weaker lock there too.
+	 * Holding ShareLock would be brief, but acquiring it would not: the
+	 * command would wait behind every open writer, and queue new writers
+	 * behind itself while it waited, which is the cost the clause exists to
+	 * avoid.
+	 *
 	 * NB: Caller is responsible for making sure that tableId refers to the
 	 * relation on which the index should be built; except in bootstrap mode,
 	 * this will typically require the caller to have already locked the
@@ -692,7 +722,7 @@ DefineIndex(ParseState *pstate,
 	 * parallel workers under the control of certain particular ambuild
 	 * functions will need to be updated, too.
 	 */
-	lockmode = concurrent ? ShareUpdateExclusiveLock : ShareLock;
+	lockmode = (concurrent || stmt->nodata) ? ShareUpdateExclusiveLock : ShareLock;
 	rel = table_open(tableId, lockmode);
 
 	/*
@@ -728,6 +758,20 @@ DefineIndex(ParseState *pstate,
 					 errdetail_relkind_not_supported(rel->rd_rel->relkind)));
 			break;
 	}
+
+	/*
+	 * Refuse a no-data index on a system catalog, even under
+	 * allow_system_table_mods.  Catalog scans reach their indexes directly
+	 * via systable_beginscan(), which does not consult indisvalid or
+	 * indisready, so an unpopulated catalog index would silently return wrong
+	 * answers rather than merely being ignored.  TOAST relations are already
+	 * excluded by the relkind check above.
+	 */
+	if (stmt->nodata && IsSystemRelation(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot create index on system catalog \"%s\" WITH NO DATA",
+						RelationGetRelationName(rel))));
 
 	/*
 	 * Establish behavior for partitioned tables, and verify sanity of
@@ -1247,8 +1291,19 @@ DefineIndex(ParseState *pstate,
 	flags = constr_flags = 0;
 	if (stmt->isconstraint)
 		flags |= INDEX_CREATE_ADD_CONSTRAINT;
-	if (skip_build || concurrent || partitioned)
+	if (skip_build || concurrent || partitioned || stmt->nodata)
 		flags |= INDEX_CREATE_SKIP_BUILD;
+
+	/*
+	 * A partitioned index is marked too, though it has no storage of its own
+	 * to leave unbuilt.  There the flag records that the index was declared
+	 * deferred, which is what later arrivals consult: a partition attached or
+	 * created under it inherits the state rather than being built.  Only a
+	 * REINDEX naming the index clears it, in ReindexPartitions(); becoming
+	 * valid does not.
+	 */
+	if (stmt->nodata)
+		flags |= INDEX_CREATE_NO_DATA;
 	if (stmt->if_not_exists)
 		flags |= INDEX_CREATE_IF_NOT_EXISTS;
 	if (concurrent)
@@ -1545,6 +1600,15 @@ DefineIndex(ParseState *pstate,
 														parentIndex,
 														attmap,
 														NULL);
+
+					/*
+					 * generateClonedIndexStmt() reconstructs the statement
+					 * from the parent index, which does not record that the
+					 * original said WITH NO DATA, so carry that down
+					 * ourselves.  Each partition's index is what the clause
+					 * is actually about.
+					 */
+					childStmt->nodata = stmt->nodata;
 
 					/*
 					 * Recurse as the starting user ID.  Callee will use that
@@ -3521,6 +3585,49 @@ reindex_error_callback(void *arg)
 }
 
 /*
+ * ClearPartitionedIndexNoData
+ *
+ * End the deferred state of a partitioned index.
+ *
+ * A partitioned index has no storage, so nothing is built here that could
+ * clear the flag the way reindex_index() does for a leaf.  What ends the state
+ * is the user naming the index in REINDEX INDEX, which is the explicit
+ * conversion the clause defers to; this records that it happened.  Validity is
+ * left to the rules that govern any other partitioned index.
+ *
+ * ShareUpdateExclusiveLock is enough to update the row, and is what the
+ * concurrent paths take to flip these flags elsewhere: index_concurrently_swap()
+ * clears indisnodata under it.  Taking AccessExclusiveLock here would queue
+ * behind any reader holding AccessShareLock on the index and block new planning
+ * on the table while it queued, at the end of a command that may have been run
+ * CONCURRENTLY precisely to avoid that.
+ */
+static void
+ClearPartitionedIndexNoData(Oid indexOid)
+{
+	Relation	pg_index;
+	HeapTuple	tup;
+	Form_pg_index indexForm;
+
+	LockRelationOid(indexOid, ShareUpdateExclusiveLock);
+
+	pg_index = table_open(IndexRelationId, RowExclusiveLock);
+	tup = SearchSysCacheCopy1(INDEXRELID, ObjectIdGetDatum(indexOid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for index %u", indexOid);
+	indexForm = (Form_pg_index) GETSTRUCT(tup);
+
+	if (indexForm->indisnodata)
+	{
+		indexForm->indisnodata = false;
+		CatalogTupleUpdate(pg_index, &tup->t_self, tup);
+	}
+
+	heap_freetuple(tup);
+	table_close(pg_index, RowExclusiveLock);
+}
+
+/*
  * ReindexPartitions
  *
  * Reindex a set of partitions, per the partitioned index or table given
@@ -3530,6 +3637,7 @@ static void
 ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *params, bool isTopLevel)
 {
 	List	   *partitions = NIL;
+	List	   *parted_idxs = NIL;
 	char		relkind = get_rel_relkind(relid);
 	char	   *relname = get_rel_name(relid);
 	char	   *relnamespace = get_namespace_name(get_rel_namespace(relid));
@@ -3585,10 +3693,22 @@ ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *param
 
 		/*
 		 * This discards partitioned tables, partitioned indexes and foreign
-		 * tables.
+		 * tables.  Partitioned indexes are kept aside: having no storage they
+		 * are not reindexed, but a deferred one named here is being converted
+		 * and must be marked once the partitions are done.  Save them in the
+		 * cross-transaction context, since the list below does not survive
+		 * ReindexMultipleInternal().
 		 */
 		if (!RELKIND_HAS_STORAGE(partkind))
+		{
+			if (partkind == RELKIND_PARTITIONED_INDEX)
+			{
+				old_context = MemoryContextSwitchTo(reindex_context);
+				parted_idxs = lappend_oid(parted_idxs, partoid);
+				MemoryContextSwitchTo(old_context);
+			}
 			continue;
+		}
 
 		Assert(partkind == RELKIND_INDEX ||
 			   partkind == RELKIND_RELATION);
@@ -3604,6 +3724,27 @@ ReindexPartitions(const ReindexStmt *stmt, Oid relid, const ReindexParams *param
 	 * this commits and then starts a new transaction immediately.
 	 */
 	ReindexMultipleInternal(stmt, partitions, params);
+
+	/*
+	 * REINDEX INDEX names the index the user wants converted, so a deferred
+	 * tree is no longer deferred once its partitions have been reindexed.
+	 * Every partitioned index underneath the one named is part of what was
+	 * named, so the whole tree is settled by the one command.  REINDEX TABLE
+	 * names no index and converts nothing, as on a plain table.
+	 */
+	if (relkind == RELKIND_PARTITIONED_INDEX)
+	{
+		/*
+		 * ReindexMultipleInternal() leaves a transaction started but no
+		 * snapshot set, and updating a catalog needs one.
+		 */
+		PushActiveSnapshot(GetTransactionSnapshot());
+
+		foreach(lc, parted_idxs)
+			ClearPartitionedIndexNoData(lfirst_oid(lc));
+
+		PopActiveSnapshot();
+	}
 
 	/*
 	 * Clean up working storage --- note we must do this after
@@ -3858,7 +3999,20 @@ ReindexRelationConcurrently(const ReindexStmt *stmt, Oid relationOid, const Rein
 					Relation	indexRelation = index_open(cellOid,
 														   ShareUpdateExclusiveLock);
 
-					if (!indexRelation->rd_index->indisvalid)
+					/*
+					 * Test indisnodata before indisvalid, since a no-data
+					 * index is also invalid.  The invalid-index message is
+					 * actively misleading for one: it is not broken, and DROP
+					 * is the opposite of what the user wants.
+					 */
+					if (indexRelation->rd_index->indisnodata)
+						ereport(WARNING,
+								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+								 errmsg("skipping reindex of index \"%s.%s\" created WITH NO DATA",
+										get_namespace_name(get_rel_namespace(cellOid)),
+										get_rel_name(cellOid)),
+								 errhint("Use REINDEX INDEX to populate it.")));
+					else if (!indexRelation->rd_index->indisvalid)
 						ereport(WARNING,
 								(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 								 errmsg("skipping reindex of invalid index \"%s.%s\"",

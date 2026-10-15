@@ -149,9 +149,6 @@ typedef struct Query
 	 */
 	int			resultRelation pg_node_attr(query_jumble_ignore);
 
-	/* FOR PORTION OF clause for UPDATE/DELETE */
-	ForPortionOfExpr *forPortionOf;
-
 	/* has aggregates in tlist or havingQual */
 	bool		hasAggs pg_node_attr(query_jumble_ignore);
 	/* has window functions in tlist */
@@ -1616,22 +1613,6 @@ typedef struct RowMarkClause
 } RowMarkClause;
 
 /*
- * ForPortionOfClause
- *		representation of FOR PORTION OF <range-name> FROM <target-start> TO
- *		<target-end> or FOR PORTION OF <range-name> (<target>)
- */
-typedef struct ForPortionOfClause
-{
-	NodeTag		type;
-	char	   *range_name;		/* column name of the range/multirange */
-	ParseLoc	location;		/* token location, or -1 if unknown */
-	ParseLoc	target_location;	/* token location, or -1 if unknown */
-	Node	   *target;			/* Expr from FOR PORTION OF col (...) syntax */
-	Node	   *target_start;	/* Expr from FROM ... TO ... syntax */
-	Node	   *target_end;		/* Expr from FROM ... TO ... syntax */
-} ForPortionOfClause;
-
-/*
  * WithClause -
  *	   representation of WITH clause
  *
@@ -2188,7 +2169,6 @@ typedef struct DeleteStmt
 	Node	   *whereClause;	/* qualifications */
 	ReturningClause *returningClause;	/* RETURNING clause */
 	WithClause *withClause;		/* WITH clause */
-	ForPortionOfClause *forPortionOf;	/* FOR PORTION OF clause */
 } DeleteStmt;
 
 /* ----------------------
@@ -2204,7 +2184,6 @@ typedef struct UpdateStmt
 	List	   *fromClause;		/* optional from clause for more tables */
 	ReturningClause *returningClause;	/* RETURNING clause */
 	WithClause *withClause;		/* WITH clause */
-	ForPortionOfClause *forPortionOf;	/* FOR PORTION OF clause */
 } UpdateStmt;
 
 /* ----------------------
@@ -2416,6 +2395,7 @@ typedef enum ObjectType
 	OBJECT_POLICY,
 	OBJECT_PROCEDURE,
 	OBJECT_PUBLICATION,
+	OBJECT_PUBLICATION_EXCLUDED_REL,
 	OBJECT_PUBLICATION_NAMESPACE,
 	OBJECT_PUBLICATION_REL,
 	OBJECT_ROLE,
@@ -3570,6 +3550,7 @@ typedef struct IndexStmt
 	bool		initdeferred;	/* is the constraint INITIALLY DEFERRED? */
 	bool		transformed;	/* true when transformIndexStmt is finished */
 	bool		concurrent;		/* should this be a concurrent index build? */
+	bool		nodata;			/* WITH NO DATA: define it but don't build */
 	bool		if_not_exists;	/* just do nothing if index already exists? */
 	bool		reset_default_tblspc;	/* reset default_tablespace prior to
 										 * executing */

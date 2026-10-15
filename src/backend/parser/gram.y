@@ -353,7 +353,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <defelt>	drop_option
 %type <boolean>	opt_or_replace opt_no
 				opt_grant_grant_option
-				opt_nowait opt_if_exists opt_with_data
+				opt_nowait opt_if_exists opt_with_data opt_index_no_data
 				opt_transaction_chain
 %type <list>	grant_role_opt_list
 %type <defelt>	grant_role_opt
@@ -556,8 +556,6 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <range>	relation_expr
 %type <range>	extended_relation_expr
 %type <range>	relation_expr_opt_alias
-%type <alias>	for_portion_of_opt_alias
-%type <node>	for_portion_of_clause
 %type <node>	tablesample_clause opt_repeatable_clause
 %type <target>	target_el set_target insert_column_item
 
@@ -778,7 +776,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	OVER OVERLAPS OVERLAY OVERRIDING OWNED OWNER
 
 	PARALLEL PARAMETER PARSER PARTIAL PARTITION PASSING PASSWORD PATH
-	PERIOD PLACING PLAN PLANS POLICY PORTION
+	PERIOD PLACING PLAN PLANS POLICY
 	POSITION PRECEDING PRECISION PRESERVE PREPARE PREPARED PRIMARY
 	PRIOR PRIVILEGES PROCEDURAL PROCEDURE PROCEDURES PROGRAM PUBLICATION
 
@@ -824,10 +822,10 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
  * NOT_LA exists so that productions such as NOT LIKE can be given the same
  * precedence as LIKE; otherwise they'd effectively have the same precedence
  * as NOT, at least with respect to their left-hand subexpression.
- * FORMAT_LA, NULLS_LA, WITH_LA, and WITHOUT_LA are needed to make the grammar
- * LALR(1).
+ * FORMAT_LA, NULLS_LA, WITH_LA, WITH_LA_NO, and WITHOUT_LA are needed to make
+ * the grammar LALR(1).
  */
-%token		FORMAT_LA NOT_LA NULLS_LA WITH_LA WITHOUT_LA
+%token		FORMAT_LA NOT_LA NULLS_LA WITH_LA WITH_LA_NO WITHOUT_LA
 
 /*
  * The grammar likewise thinks these tokens are keywords, but they are never
@@ -897,15 +895,12 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
  * json_predicate_type_constraint and json_key_uniqueness_constraint_opt
  * productions (see comments there).
  *
- * TO is assigned the same precedence as IDENT, to support the opt_interval
- * production (see comment there).
- *
  * Like the UNBOUNDED PRECEDING/FOLLOWING case, NESTED is assigned a lower
  * precedence than PATH to fix ambiguity in the json_table production.
  */
 %nonassoc	UNBOUNDED NESTED /* ideally would have same precedence as IDENT */
 %nonassoc	IDENT PARTITION RANGE ROWS GROUPS PRECEDING FOLLOWING CUBE ROLLUP
-			SET KEYS OBJECT_P SCALAR TO USING VALUE_P WITH WITHOUT PATH
+			SET KEYS OBJECT_P SCALAR VALUE_P WITH WITHOUT PATH
 %left		Op OPERATOR		/* multi-character ops and user-defined operators */
 %left		'+' '-'
 %left		'*' '/' '%'
@@ -1243,6 +1238,7 @@ CreateRoleStmt:
 
 opt_with:	WITH
 			| WITH_LA
+			| WITH_LA_NO
 			| /*EMPTY*/
 		;
 
@@ -1653,11 +1649,8 @@ OptSchemaEltList:
 schema_stmt:
 			CreateStmt
 			| IndexStmt
-			| CreateDomainStmt
-			| CreateFunctionStmt
 			| CreateSeqStmt
 			| CreateTrigStmt
-			| DefineStmt
 			| GrantStmt
 			| ViewStmt
 		;
@@ -4949,10 +4942,24 @@ create_as_target:
 				}
 		;
 
+/*
+ * Note that WITH NO DATA must be spelled with WITH_LA_NO, because the scanner
+ * converts WITH to WITH_LA_NO unconditionally whenever NO follows it.
+ */
 opt_with_data:
 			WITH DATA_P								{ $$ = true; }
-			| WITH NO DATA_P						{ $$ = false; }
+			| WITH_LA_NO NO DATA_P					{ $$ = false; }
 			| /*EMPTY*/								{ $$ = true; }
+		;
+
+/*
+ * Unlike opt_with_data, this does not accept the redundant WITH DATA: doing so
+ * would conflict with opt_reloptions, and would need a second lookahead token
+ * to resolve.
+ */
+opt_index_no_data:
+			WITH_LA_NO NO DATA_P					{ $$ = true; }
+			| /*EMPTY*/								{ $$ = false; }
 		;
 
 
@@ -8348,6 +8355,7 @@ defacl_privilege_target:
 IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_single_name
 			ON relation_expr access_method_clause '(' index_params ')'
 			opt_include opt_unique_null_treatment opt_reloptions OptTableSpace where_clause
+			opt_index_no_data
 				{
 					IndexStmt *n = makeNode(IndexStmt);
 
@@ -8362,6 +8370,7 @@ IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_single_name
 					n->options = $14;
 					n->tableSpace = $15;
 					n->whereClause = $16;
+					n->nodata = $17;
 					n->excludeOpNames = NIL;
 					n->idxcomment = NULL;
 					n->indexOid = InvalidOid;
@@ -8380,6 +8389,7 @@ IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_single_name
 			| CREATE opt_unique INDEX opt_concurrently IF_P NOT EXISTS name
 			ON relation_expr access_method_clause '(' index_params ')'
 			opt_include opt_unique_null_treatment opt_reloptions OptTableSpace where_clause
+			opt_index_no_data
 				{
 					IndexStmt *n = makeNode(IndexStmt);
 
@@ -8394,6 +8404,7 @@ IndexStmt:	CREATE opt_unique INDEX opt_concurrently opt_single_name
 					n->options = $17;
 					n->tableSpace = $18;
 					n->whereClause = $19;
+					n->nodata = $20;
 					n->excludeOpNames = NIL;
 					n->idxcomment = NULL;
 					n->indexOid = InvalidOid;
@@ -12054,9 +12065,10 @@ AlterTSConfigurationStmt:
 				}
 		;
 
-/* Use this if TIME or ORDINALITY after WITH should be taken as an identifier */
+/* Use this if TIME, ORDINALITY or NO after WITH should be taken as an identifier */
 any_with:	WITH
 			| WITH_LA
+			| WITH_LA_NO
 		;
 
 
@@ -12720,21 +12732,6 @@ DeleteStmt: opt_with_clause DELETE_P FROM relation_expr_opt_alias
 					n->withClause = $1;
 					$$ = (Node *) n;
 				}
-			| opt_with_clause DELETE_P FROM relation_expr
-			for_portion_of_clause for_portion_of_opt_alias
-			using_clause where_or_current_clause returning_clause
-				{
-					DeleteStmt *n = makeNode(DeleteStmt);
-
-					n->relation = $4;
-					n->forPortionOf = (ForPortionOfClause *) $5;
-					n->relation->alias = $6;
-					n->usingClause = $7;
-					n->whereClause = $8;
-					n->returningClause = $9;
-					n->withClause = $1;
-					$$ = (Node *) n;
-				}
 		;
 
 using_clause:
@@ -12806,25 +12803,6 @@ UpdateStmt: opt_with_clause UPDATE relation_expr_opt_alias
 					n->fromClause = $6;
 					n->whereClause = $7;
 					n->returningClause = $8;
-					n->withClause = $1;
-					$$ = (Node *) n;
-				}
-			| opt_with_clause UPDATE relation_expr
-			for_portion_of_clause for_portion_of_opt_alias
-			SET set_clause_list
-			from_clause
-			where_or_current_clause
-			returning_clause
-				{
-					UpdateStmt *n = makeNode(UpdateStmt);
-
-					n->relation = $3;
-					n->forPortionOf = (ForPortionOfClause *) $4;
-					n->relation->alias = $5;
-					n->targetList = $7;
-					n->fromClause = $8;
-					n->whereClause = $9;
-					n->returningClause = $10;
 					n->withClause = $1;
 					$$ = (Node *) n;
 				}
@@ -13324,7 +13302,8 @@ simple_select:
  * WITH [ RECURSIVE ] <query name> [ (<column>,...) ]
  *		AS (query) [ SEARCH or CYCLE clause ]
  *
- * Recognizing WITH_LA here allows a CTE to be named TIME or ORDINALITY.
+ * Recognizing WITH_LA here allows a CTE to be named TIME or ORDINALITY, and
+ * WITH_LA_NO allows one to be named NO.
  */
 with_clause:
 		WITH cte_list
@@ -13335,6 +13314,13 @@ with_clause:
 				$$->location = @1;
 			}
 		| WITH_LA cte_list
+			{
+				$$ = makeNode(WithClause);
+				$$->ctes = $2;
+				$$->recursive = false;
+				$$->location = @1;
+			}
+		| WITH_LA_NO cte_list
 			{
 				$$ = makeNode(WithClause);
 				$$->ctes = $2;
@@ -14319,55 +14305,6 @@ relation_expr_opt_alias: relation_expr					%prec UMINUS
 		;
 
 /*
- * If an UPDATE/DELETE has FOR PORTION OF, then the relation_expr is separated
- * from its potential alias by the for_portion_of_clause. So this production
- * handles the potential alias in those cases. We need to solve the same
- * problems as relation_expr_opt_alias, in particular resolving a shift/reduce
- * conflict where "set set" could be an alias plus the SET keyword, or the SET
- * keyword then a column name. As above, we force the latter interpretation by
- * giving the non-alias choice a higher precedence.
- */
-for_portion_of_opt_alias:
-			AS ColId
-				{
-					Alias	   *alias = makeNode(Alias);
-
-					alias->aliasname = $2;
-					$$ = alias;
-				}
-			| BareColLabel
-				{
-					Alias	   *alias = makeNode(Alias);
-
-					alias->aliasname = $1;
-					$$ = alias;
-				}
-			| /* empty */ %prec UMINUS { $$ = NULL; }
-		;
-
-for_portion_of_clause:
-			FOR PORTION OF ColId '(' a_expr ')'
-				{
-					ForPortionOfClause *n = makeNode(ForPortionOfClause);
-					n->range_name = $4;
-					n->location = @4;
-					n->target = $6;
-					n->target_location = @6;
-					$$ = (Node *) n;
-				}
-			| FOR PORTION OF ColId FROM a_expr TO a_expr
-				{
-					ForPortionOfClause *n = makeNode(ForPortionOfClause);
-					n->range_name = $4;
-					n->location = @4;
-					n->target_start = $6;
-					n->target_end = $8;
-					n->target_location = @5;
-					$$ = (Node *) n;
-				}
-		;
-
-/*
  * TABLESAMPLE decoration in a FROM item
  */
 tablesample_clause:
@@ -15285,25 +15222,16 @@ opt_timezone:
 			| /*EMPTY*/								{ $$ = false; }
 		;
 
-/*
- * We need to handle this shift/reduce conflict:
- * FOR PORTION OF valid_at FROM t + INTERVAL '1' YEAR TO MONTH.
- * We don't see far enough ahead to know if there is another TO coming.
- * We prefer to interpret this as FROM (t + INTERVAL '1' YEAR TO MONTH),
- * i.e. to shift.
- * That gives the user the option of adding parentheses to get the other meaning.
- * If we reduced, intervals could never have a TO.
- */
 opt_interval:
-			YEAR_P																%prec IS
+			YEAR_P
 				{ $$ = list_make1(makeIntConst(INTERVAL_MASK(YEAR), @1)); }
 			| MONTH_P
 				{ $$ = list_make1(makeIntConst(INTERVAL_MASK(MONTH), @1)); }
-			| DAY_P																%prec IS
+			| DAY_P
 				{ $$ = list_make1(makeIntConst(INTERVAL_MASK(DAY), @1)); }
-			| HOUR_P															%prec IS
+			| HOUR_P
 				{ $$ = list_make1(makeIntConst(INTERVAL_MASK(HOUR), @1)); }
-			| MINUTE_P														%prec IS
+			| MINUTE_P
 				{ $$ = list_make1(makeIntConst(INTERVAL_MASK(MINUTE), @1)); }
 			| interval_second
 				{ $$ = $1; }
@@ -18378,7 +18306,6 @@ unreserved_keyword:
 			| PLAN
 			| PLANS
 			| POLICY
-			| PORTION
 			| PRECEDING
 			| PREPARE
 			| PREPARED
@@ -19011,7 +18938,6 @@ bare_label_keyword:
 			| PLAN
 			| PLANS
 			| POLICY
-			| PORTION
 			| POSITION
 			| PRECEDING
 			| PREPARE

@@ -73,6 +73,7 @@
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
+#include "utils/injection_point.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -120,7 +121,8 @@ static void UpdateIndexRelation(Oid indexoid, Oid heapoid,
 								bool isexclusion,
 								bool immediate,
 								bool isvalid,
-								bool isready);
+								bool isready,
+								bool isnodata);
 static void index_update_stats(Relation rel,
 							   bool hasindex,
 							   double reltuples);
@@ -572,7 +574,8 @@ UpdateIndexRelation(Oid indexoid,
 					bool isexclusion,
 					bool immediate,
 					bool isvalid,
-					bool isready)
+					bool isready,
+					bool isnodata)
 {
 	int2vector *indkey;
 	oidvector  *indcollation;
@@ -650,6 +653,7 @@ UpdateIndexRelation(Oid indexoid,
 	values[Anum_pg_index_indisready - 1] = BoolGetDatum(isready);
 	values[Anum_pg_index_indislive - 1] = BoolGetDatum(true);
 	values[Anum_pg_index_indisreplident - 1] = BoolGetDatum(false);
+	values[Anum_pg_index_indisnodata - 1] = BoolGetDatum(isnodata);
 	values[Anum_pg_index_indkey - 1] = PointerGetDatum(indkey);
 	values[Anum_pg_index_indcollation - 1] = PointerGetDatum(indcollation);
 	values[Anum_pg_index_indclass - 1] = PointerGetDatum(indclass);
@@ -720,6 +724,17 @@ UpdateIndexRelation(Oid indexoid,
  *		INDEX_CREATE_DEFERRABLE:
  *			index supports a deferrable constraint, mark it as
  *			non-immediate (indimmediate = false).
+ *		INDEX_CREATE_NO_DATA:
+ *			the index is defined but deliberately left unpopulated
+ *			(CREATE INDEX ... WITH NO DATA).  Mark it indisnodata, and
+ *			neither valid nor ready, so that queries ignore it and the
+ *			executor does not maintain it.  Must be combined with
+ *			INDEX_CREATE_SKIP_BUILD; a later REINDEX populates it.
+ *			A partitioned index is still marked ready: it has no storage
+ *			of its own for indisready to describe, and every other
+ *			partitioned index is created ready, so leaving it unready
+ *			would produce a flag combination no other partitioned index
+ *			can reach and that clearing indisnodata does not undo.
  *
  * constr_flags: flags passed to index_constraint_create
  *		(only if INDEX_CREATE_ADD_CONSTRAINT is set)
@@ -769,6 +784,7 @@ index_create(Relation heapRelation,
 	bool		invalid = (flags & INDEX_CREATE_INVALID) != 0;
 	bool		concurrent = (flags & INDEX_CREATE_CONCURRENT) != 0;
 	bool		partitioned = (flags & INDEX_CREATE_PARTITIONED) != 0;
+	bool		nodata = (flags & INDEX_CREATE_NO_DATA) != 0;
 	bool		progress = (flags & INDEX_CREATE_SUPPRESS_PROGRESS) == 0;
 	char		relkind;
 	TransactionId relfrozenxid;
@@ -780,6 +796,8 @@ index_create(Relation heapRelation,
 		   ((flags & INDEX_CREATE_ADD_CONSTRAINT) != 0));
 	/* partitioned indexes must never be "built" by themselves */
 	Assert(!partitioned || (flags & INDEX_CREATE_SKIP_BUILD));
+	/* a no-data index is unbuilt by definition, and can't be concurrent */
+	Assert(!nodata || ((flags & INDEX_CREATE_SKIP_BUILD) && !concurrent));
 
 	relkind = partitioned ? RELKIND_PARTITIONED_INDEX : RELKIND_INDEX;
 	is_exclusion = (indexInfo->ii_ExclusionOps != NULL);
@@ -1059,8 +1077,9 @@ index_create(Relation heapRelation,
 						isprimary, is_exclusion,
 						(constr_flags & INDEX_CONSTR_CREATE_DEFERRABLE) == 0 &&
 						(flags & INDEX_CREATE_DEFERRABLE) == 0,
-						!concurrent && !invalid,
-						!concurrent);
+						!concurrent && !invalid && !nodata,
+						!concurrent && !(nodata && !partitioned),
+						nodata);
 
 	/*
 	 * Register relcache invalidation on the indexes' heap relation, to
@@ -1284,6 +1303,14 @@ index_create(Relation heapRelation,
 						   -1.0);
 		/* Make the above update visible */
 		CommandCounterIncrement();
+
+		/*
+		 * A no-data index has no later caller to fill it in, so if it is
+		 * unlogged we must write its init fork ourselves; every other
+		 * skip-build caller reaches index_build() eventually.
+		 */
+		if (nodata)
+			index_write_init_fork(indexRelation);
 	}
 	else
 	{
@@ -1679,6 +1706,18 @@ index_concurrently_swap(Oid newIndexId, Oid oldIndexId, const char *oldName)
 	oldIndexForm->indisvalid = false;
 	oldIndexForm->indisclustered = false;
 	oldIndexForm->indisreplident = false;
+
+	/*
+	 * The old index keeps the storage the new one replaced, which for an
+	 * index created WITH NO DATA was never built.  Clear the flag anyway:
+	 * what is left here is transient debris awaiting the drop two phases from
+	 * now, and if the command does not reach that drop it must not be
+	 * mistaken for an index the user deferred and still intends to populate.
+	 * pg_dump would carry it into the new database as a definition, psql
+	 * would render it as having no data rather than as invalid, and a query
+	 * looking for indexes awaiting a build would list it.
+	 */
+	oldIndexForm->indisnodata = false;
 
 	CatalogTupleUpdate(pg_index, &oldIndexTuple->t_self, oldIndexTuple);
 	CatalogTupleUpdate(pg_index, &newIndexTuple->t_self, newIndexTuple);
@@ -2331,6 +2370,12 @@ index_drop(Oid indexId, bool concurrent, bool concurrent_lock_mode)
 		StartTransactionCommand();
 
 		/*
+		 * The dead pg_index row is committed but the index is still there, so
+		 * this is the point at which a failure leaves one behind.
+		 */
+		INJECTION_POINT("drop-index-concurrently-after-set-dead", NULL);
+
+		/*
 		 * Wait till every transaction that saw the old index state has
 		 * finished.  See above about progress reporting.
 		 */
@@ -2753,6 +2798,80 @@ BuildSpeculativeIndexInfo(Relation index, IndexInfo *ii)
 }
 
 /* ----------------
+ * IsIndexCompatibleAsArbiter
+ *		Return true if two indexes of the same table are interchangeable as
+ *		speculative insertion arbiters for INSERT ON CONFLICT.
+ *
+ * To be interchangeable, the two indexes must agree on which tuples conflict,
+ * so every property bearing on that must be identical.  Indexes that merely
+ * index the same columns can each have their own notion of what a duplicate
+ * is, and treating one as arbiter in place of the other would resolve
+ * conflicts the other does not have.
+ *
+ * This is built for REINDEX CONCURRENTLY: while it processes an arbiter
+ * index, an exact copy of it built by index_create_copy() exists alongside,
+ * and both copies must arbitrate together for all concurrent sessions to
+ * agree on the set of arbiters.
+ *
+ * Properties that do not affect which tuples conflict, such as validity,
+ * are deliberately not examined here; callers must check them as needed.
+ * ----------------
+ */
+bool
+IsIndexCompatibleAsArbiter(Relation indexRel1, Relation indexRel2)
+{
+	Form_pg_index indexForm1 = indexRel1->rd_index;
+	Form_pg_index indexForm2 = indexRel2->rd_index;
+
+	/* Only indexes of the same relation can be compared. */
+	Assert(indexForm1->indrelid == indexForm2->indrelid);
+
+	/* must match whether they're unique */
+	if (indexForm1->indisunique != indexForm2->indisunique)
+		return false;
+
+	/* No support currently for comparing exclusion indexes. */
+	if (indexForm1->indisexclusion || indexForm2->indisexclusion)
+		return false;
+
+	/* a deferrable index detects conflicts at a different time */
+	if (indexForm1->indimmediate != indexForm2->indimmediate)
+		return false;
+
+	/* the "nulls not distinct" criterion must match */
+	if (indexForm1->indnullsnotdistinct != indexForm2->indnullsnotdistinct)
+		return false;
+
+	/* number of key attributes must match */
+	if (indexForm1->indnkeyatts != indexForm2->indnkeyatts)
+		return false;
+
+	/* key columns, and their collations and opfamilies, must match */
+	for (int i = 0; i < indexForm1->indnkeyatts; i++)
+	{
+		if (indexForm1->indkey.values[i] != indexForm2->indkey.values[i])
+			return false;
+
+		if (indexRel1->rd_indcollation[i] != indexRel2->rd_indcollation[i])
+			return false;
+
+		if (indexRel1->rd_opfamily[i] != indexRel2->rd_opfamily[i])
+			return false;
+	}
+
+	/* index expressions and predicate must match */
+	if (!equal(RelationGetIndexExpressions(indexRel1),
+			   RelationGetIndexExpressions(indexRel2)))
+		return false;
+
+	if (!equal(RelationGetIndexPredicate(indexRel1),
+			   RelationGetIndexPredicate(indexRel2)))
+		return false;
+
+	return true;
+}
+
+/* ----------------
  *		FormIndexDatum
  *			Construct values[] and isnull[] arrays for a new index tuple.
  *
@@ -3029,6 +3148,44 @@ index_update_stats(Relation rel,
 
 
 /*
+ * index_write_init_fork - write an unlogged index's init fork, if needed
+ *
+ * Every unlogged relation has a WAL-logged init fork, and that is the whole
+ * of its durability story: RelationCreateStorage() creates only the main
+ * fork, and does not WAL-log it for an unlogged relation.  Recovery resets
+ * such a relation from its init fork.
+ *
+ * We must first check whether one already exists.  If, for example, an
+ * unlogged relation is truncated in the transaction that created it, or
+ * truncated twice in a subsequent transaction, the relfilenumber won't
+ * change, and nothing needs to be done here.
+ *
+ * This is normally reached from index_build(), once ambuild() has run.  It is
+ * also called on the paths that deliberately leave an index unbuilt -- an
+ * index created WITH NO DATA, and one re-storaged but not rebuilt by
+ * reindex_relation() -- so that such an index is structurally identical to
+ * every other unlogged index, and the recovery path needs no special case for
+ * it.  ambuildempty is mandatory for every index AM (asserted in
+ * index_build), so this is always callable.
+ *
+ * Note that ambuildempty writes a valid empty index rather than leaving a
+ * zero-length file; that is the same on-disk shape TRUNCATE leaves behind,
+ * and a no-data index is still semantically empty because indisnodata,
+ * indisvalid and indisready say so.
+ */
+void
+index_write_init_fork(Relation indexRelation)
+{
+	if (indexRelation->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED &&
+		!smgrexists(RelationGetSmgr(indexRelation), INIT_FORKNUM))
+	{
+		smgrcreate(RelationGetSmgr(indexRelation), INIT_FORKNUM, false);
+		log_smgrcreate(&indexRelation->rd_locator, INIT_FORKNUM);
+		indexRelation->rd_indam->ambuildempty(indexRelation);
+	}
+}
+
+/*
  * index_build - invoke access-method-specific index build procedure
  *
  * On entry, the index's catalog entries are valid, and its physical disk
@@ -3130,18 +3287,9 @@ index_build(Relation heapRelation,
 
 	/*
 	 * If this is an unlogged index, we may need to write out an init fork for
-	 * it -- but we must first check whether one already exists.  If, for
-	 * example, an unlogged relation is truncated in the transaction that
-	 * created it, or truncated twice in a subsequent transaction, the
-	 * relfilenumber won't change, and nothing needs to be done here.
+	 * it.
 	 */
-	if (indexRelation->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED &&
-		!smgrexists(RelationGetSmgr(indexRelation), INIT_FORKNUM))
-	{
-		smgrcreate(RelationGetSmgr(indexRelation), INIT_FORKNUM, false);
-		log_smgrcreate(&indexRelation->rd_locator, INIT_FORKNUM);
-		indexRelation->rd_indam->ambuildempty(indexRelation);
-	}
+	index_write_init_fork(indexRelation);
 
 	/*
 	 * If we found any potentially broken HOT chains, mark the index as not
@@ -3455,6 +3603,7 @@ validate_index(Oid heapId, Oid indexId, Snapshot snapshot)
 	ivinfo.index = indexRelation;
 	ivinfo.heaprel = heapRelation;
 	ivinfo.analyze_only = false;
+	ivinfo.is_autovacuum = false;
 	ivinfo.report_progress = true;
 	ivinfo.estimated_count = true;
 	ivinfo.message_level = DEBUG2;
@@ -3573,6 +3722,17 @@ index_set_state_flags(Oid indexId, IndexStateFlagsAction action)
 			Assert(!indexForm->indisready);
 			Assert(!indexForm->indisvalid);
 			indexForm->indisready = true;
+
+			/*
+			 * An index that is being made ready has data, so it is no longer
+			 * a no-data index.  This is not reachable today -- the concurrent
+			 * completion path builds a fresh copy and swaps it in, so the row
+			 * carrying indisnodata is dropped rather than updated -- but the
+			 * flag must never be observably true on an index with data, and
+			 * this is the concurrent counterpart of the clearing that
+			 * reindex_index() does.
+			 */
+			indexForm->indisnodata = false;
 			break;
 		case INDEX_CREATE_SET_VALID:
 			/* Set indisvalid during a CREATE INDEX CONCURRENTLY sequence */
@@ -3608,12 +3768,18 @@ index_set_state_flags(Oid indexId, IndexStateFlagsAction action)
 			 * We clear both indisready and indislive, because we not only
 			 * want to stop updates, we want to prevent sessions from touching
 			 * the index at all.
+			 *
+			 * indisnodata goes with them.  From here the row is wreckage left
+			 * behind by an interrupted drop, not a definition awaiting a
+			 * build, and anything reporting the no-data state would otherwise
+			 * present it as one.
 			 */
 			Assert(!indexForm->indisvalid);
 			Assert(!indexForm->indisclustered);
 			Assert(!indexForm->indisreplident);
 			indexForm->indisready = false;
 			indexForm->indislive = false;
+			indexForm->indisnodata = false;
 			break;
 	}
 
@@ -3921,6 +4087,10 @@ reindex_index(const ReindexStmt *stmt, Oid indexId,
 			indexForm->indisvalid = true;
 			indexForm->indisready = true;
 			indexForm->indislive = true;
+
+			/* An index we have just built is by definition not no-data. */
+			indexForm->indisnodata = false;
+
 			CatalogTupleUpdate(pg_index, &indexTuple->t_self, indexTuple);
 
 			/*
@@ -4114,6 +4284,61 @@ reindex_relation(const ReindexStmt *stmt, Oid relid, int flags,
 			 * as it is skipped here due to the hard failure that would happen
 			 * in reindex_index(), should we try to process it.
 			 */
+			if (flags & REINDEX_REL_SUPPRESS_INDEX_USE)
+				RemoveReindexPending(indexOid);
+			continue;
+		}
+
+		/*
+		 * Skip an index that was created WITH NO DATA and has not been
+		 * populated yet.  Only a command that names the index populates it;
+		 * commands that process every index of a relation leave it alone,
+		 * whether rebuilding indexes is their purpose (REINDEX TABLE) or a
+		 * side effect (VACUUM FULL, CLUSTER, REPACK, TRUNCATE, ALTER TABLE
+		 * rewrites).
+		 *
+		 * The danger a bulk operation must avoid is failing wholesale because
+		 * one unique index turns out to sit over non-unique data -- which is
+		 * exactly what a never-populated unique index might do.  Beyond that,
+		 * a rewrite's duration must not depend on whether a no-data index
+		 * happens to exist on the table, or the promise that the user chooses
+		 * when the expensive build happens is worthless.
+		 *
+		 * Note this must live here rather than in reindex_index(): the
+		 * targeted forms reach reindex_index() without passing through this
+		 * function, including ReindexPartitions() fanning REINDEX INDEX out
+		 * over the leaves of a partitioned index, which is supposed to
+		 * populate them.
+		 *
+		 * "Skip" is not "leave untouched".  A rewrite still needs the index
+		 * to end up with storage of the new heap's persistence, since
+		 * finish_heap_swap() passes REINDEX_REL_FORCE_INDEXES_UNLOGGED or
+		 * _PERMANENT for precisely that reason; otherwise ALTER TABLE ... SET
+		 * UNLOGGED would leave a wrongly-persisted index behind.  So give it
+		 * fresh, empty, correctly-persisted storage and stop there: no
+		 * index_build(), and no flag update.  That is strictly less work than
+		 * rebuilding it.
+		 */
+		if (get_index_isnodata(indexOid))
+		{
+			Relation	iRel = index_open(indexOid, AccessExclusiveLock);
+
+			RelationSetNewRelfilenumber(iRel, persistence);
+			index_write_init_fork(iRel);
+			index_close(iRel, NoLock);
+
+			/*
+			 * Warn only if the user actually asked for a REINDEX.  A warning
+			 * on every vacuum of a table that happens to carry a no-data
+			 * index would be pure noise.
+			 */
+			if (stmt != NULL)
+				ereport(WARNING,
+						(errmsg("skipping reindex of index \"%s.%s\" created WITH NO DATA",
+								get_namespace_name(indexNamespaceId),
+								get_rel_name(indexOid)),
+						 errhint("Use REINDEX INDEX to populate it.")));
+
 			if (flags & REINDEX_REL_SUPPRESS_INDEX_USE)
 				RemoveReindexPending(indexOid);
 			continue;

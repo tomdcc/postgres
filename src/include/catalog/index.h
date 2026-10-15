@@ -73,6 +73,7 @@ extern void index_check_primary_key(Relation heapRel,
 #define INDEX_CREATE_INVALID				(1 << 6)
 #define INDEX_CREATE_SUPPRESS_PROGRESS		(1 << 7)
 #define INDEX_CREATE_DEFERRABLE				(1 << 8)
+#define INDEX_CREATE_NO_DATA				(1 << 9)
 
 extern Oid	index_create(Relation heapRelation,
 						 const char *indexRelationName,
@@ -140,11 +141,16 @@ extern bool CompareIndexInfo(const IndexInfo *info1, const IndexInfo *info2,
 
 extern void BuildSpeculativeIndexInfo(Relation index, IndexInfo *ii);
 
+extern bool IsIndexCompatibleAsArbiter(Relation indexRel1,
+									   Relation indexRel2);
+
 extern void FormIndexDatum(IndexInfo *indexInfo,
 						   TupleTableSlot *slot,
 						   EState *estate,
 						   Datum *values,
 						   bool *isnull);
+
+extern void index_write_init_fork(Relation indexRelation);
 
 extern void index_build(Relation heapRelation,
 						Relation indexRelation,

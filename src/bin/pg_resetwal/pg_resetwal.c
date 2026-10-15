@@ -233,7 +233,7 @@ main(int argc, char *argv[])
 					pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 					exit(1);
 				}
-				newest_commit_ts_xid_val = strtoul(endptr + 1, &endptr2, 0);
+				newest_commit_ts_xid_val = strtouint32_strict(endptr + 1, &endptr2, 0);
 				if (endptr2 == endptr + 1 || *endptr2 != '\0' || errno != 0)
 				{
 					pg_log_error("invalid argument for option %s", "-c");
@@ -482,8 +482,10 @@ main(int argc, char *argv[])
 
 	if (commit_ts_xids_given)
 	{
-		ControlFile.checkPointCopy.oldestCommitTsXid = oldest_commit_ts_xid_val;
-		ControlFile.checkPointCopy.newestCommitTsXid = newest_commit_ts_xid_val;
+		if (oldest_commit_ts_xid_val != InvalidTransactionId)
+			ControlFile.checkPointCopy.oldestCommitTsXid = oldest_commit_ts_xid_val;
+		if (newest_commit_ts_xid_val != InvalidTransactionId)
+			ControlFile.checkPointCopy.newestCommitTsXid = newest_commit_ts_xid_val;
 	}
 
 	if (next_oid_given)
@@ -775,7 +777,7 @@ PrintControlValues(bool guessed)
 	printf(_("Latest checkpoint's NextXID:          %u:%u\n"),
 		   EpochFromFullTransactionId(ControlFile.checkPointCopy.nextXid),
 		   XidFromFullTransactionId(ControlFile.checkPointCopy.nextXid));
-	printf(_("Latest checkpoint's NextOID:          " OID8_FORMAT "\n"),
+	printf(_("Latest checkpoint's NextOID:          %" PRIu64 "\n"),
 		   ControlFile.checkPointCopy.nextOid);
 	printf(_("Latest checkpoint's NextMultiXactId:  %u\n"),
 		   ControlFile.checkPointCopy.nextMulti);
@@ -861,7 +863,7 @@ PrintNewControlValues(void)
 
 	if (next_oid_given)
 	{
-		printf(_("NextOID:                              " OID8_FORMAT "\n"),
+		printf(_("NextOID:                              %" PRIu64 "\n"),
 			   ControlFile.checkPointCopy.nextOid);
 	}
 
@@ -922,6 +924,13 @@ RewriteControlFile(void)
 	ControlFile.backupStartPoint = InvalidXLogRecPtr;
 	ControlFile.backupEndPoint = InvalidXLogRecPtr;
 	ControlFile.backupEndRequired = false;
+
+	/*
+	 * The old WAL is gone and the new position may lie below the old
+	 * watermark, which would make replay ignore future checksum transition
+	 * records.  The state itself is kept.
+	 */
+	ControlFile.data_checksum_lsn = InvalidXLogRecPtr;
 
 	/*
 	 * Force the defaults for max_* settings. The values don't really matter

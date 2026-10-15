@@ -356,6 +356,39 @@ REPACK clstr_matview USING INDEX clstr_matview_idx;
 SELECT relfilenode = :relfilenode FROM pg_class WHERE oid = 'clstr_matview'::regclass;
 DROP MATERIALIZED VIEW clstr_matview;
 
+-- An index created WITH NO DATA does not stop CLUSTER or REPACK, and is not
+-- populated by them.  It does still get fresh, correctly-persisted storage,
+-- as reindex_relation() gives it -- "skip" is not "leave untouched" -- so
+-- every relfilenode here moves; what must not change is the deferred state.
+CREATE TABLE clstr_nodata (a int, b int);
+INSERT INTO clstr_nodata SELECT g, g FROM generate_series(1, 100) g;
+CREATE INDEX clstr_nodata_plain ON clstr_nodata (a);
+CREATE INDEX clstr_nodata_idx ON clstr_nodata (b) WITH NO DATA;
+SELECT relfilenode AS nd_heap FROM pg_class
+  WHERE oid = 'clstr_nodata'::regclass \gset
+SELECT relfilenode AS nd_plain FROM pg_class
+  WHERE oid = 'clstr_nodata_plain'::regclass \gset
+SELECT relfilenode AS nd_idx FROM pg_class
+  WHERE oid = 'clstr_nodata_idx'::regclass \gset
+CLUSTER clstr_nodata USING clstr_nodata_plain;
+REPACK clstr_nodata;
+SELECT c.relname,
+       c.relfilenode <> CASE c.relname
+                          WHEN 'clstr_nodata' THEN :nd_heap
+                          WHEN 'clstr_nodata_plain' THEN :nd_plain
+                          ELSE :nd_idx
+                        END AS relfilenode_moved
+  FROM pg_class c
+  WHERE c.relname LIKE 'clstr_nodata%' ORDER BY 1;
+SELECT indisnodata, indisvalid, indisready FROM pg_index
+  WHERE indexrelid = 'clstr_nodata_idx'::regclass;
+-- and it still completes afterwards
+REINDEX INDEX clstr_nodata_idx;
+SELECT indisnodata, indisvalid, indisready FROM pg_index
+  WHERE indexrelid = 'clstr_nodata_idx'::regclass;
+SELECT count(*) FROM clstr_nodata WHERE b = 42;
+DROP TABLE clstr_nodata;
+
 ----------------------------------------------------------------------
 --
 -- REPACK

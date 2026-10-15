@@ -1205,6 +1205,9 @@ retry:
 	relation->rd_fkeylist = NIL;
 	relation->rd_fkeyvalid = false;
 
+	/* TOAST type data is not loaded till asked for */
+	relation->rd_toastchunkidtype = InvalidOid;
+
 	/* partitioning data is not loaded till asked for */
 	relation->rd_partkey = NULL;
 	relation->rd_partkeycxt = NULL;
@@ -2137,16 +2140,6 @@ RelationIdGetRelation(Oid relationId)
 	return rd;
 }
 
-/*
- * Returns a schema-qualified name of the relation.
- */
-char *
-RelationGetQualifiedRelationName(Relation rel)
-{
-	return get_qualified_objname(RelationGetNamespace(rel),
-								 RelationGetRelationName(rel));
-}
-
 /* ----------------------------------------------------------------
  *				cache invalidation support routines
  * ----------------------------------------------------------------
@@ -2362,6 +2355,7 @@ RelationReloadIndexInfo(Relation relation)
 		relation->rd_index->indisready = index->indisready;
 		relation->rd_index->indislive = index->indislive;
 		relation->rd_index->indisreplident = index->indisreplident;
+		relation->rd_index->indisnodata = index->indisnodata;
 
 		/* Copy xmin too, as that is needed to make sense of indcheckxmin */
 		HeapTupleHeaderSetXmin(relation->rd_indextuple->t_data,
@@ -5101,6 +5095,39 @@ RelationGetReplicaIndex(Relation relation)
 }
 
 /*
+ * RelationGetToastChunkIdType -- get the type of the relation's TOAST
+ *		table "chunk_id" column
+ *
+ * Returns OIDOID or OID8OID, or InvalidOid if the relation has no TOAST
+ * table.
+ */
+Oid
+RelationGetToastChunkIdType(Relation relation)
+{
+	Oid			toastrelid = relation->rd_rel->reltoastrelid;
+	Oid			typid;
+
+	/* Quick exit if we already computed the value */
+	if (OidIsValid(relation->rd_toastchunkidtype))
+		return relation->rd_toastchunkidtype;
+
+	/* Nothing to report without a TOAST table */
+	if (!OidIsValid(toastrelid))
+		return InvalidOid;
+
+	typid = get_atttype(toastrelid, 1);
+	if (!OidIsValid(typid))
+		elog(ERROR, "cache lookup failed for TOAST relation %u",
+			 toastrelid);
+	if (typid != OIDOID && typid != OID8OID)
+		elog(ERROR, "unexpected type %u for chunk_id in TOAST relation %u",
+			 typid, toastrelid);
+
+	relation->rd_toastchunkidtype = typid;
+	return typid;
+}
+
+/*
  * RelationGetIndexExpressions -- get the index expressions for an index
  *
  * We cache the result of transforming pg_index.indexprs into a node tree.
@@ -5383,6 +5410,17 @@ restart:
 	 * included in HOT-safety decisions (see README.HOT).  If a DROP INDEX
 	 * CONCURRENTLY is far enough along that we should ignore the index, it
 	 * won't be returned at all by RelationGetIndexList.
+	 *
+	 * An index created WITH NO DATA is the one exception, and is skipped
+	 * entirely.  It holds no entries, nothing maintains it, and while it is
+	 * unpopulated it can neither be referenced by a foreign key nor serve as
+	 * the primary key or the replica identity, so it belongs in none of these
+	 * bitmaps.  Unlike an index whose concurrent build is under way, it will
+	 * not acquire entries behind our back: only a REINDEX naming it populates
+	 * it, and that either takes a lock excluding the updates these bitmaps
+	 * govern or, when CONCURRENTLY, builds a separate index that is accounted
+	 * for on its own.  reindex_index() invalidates this relcache entry in the
+	 * same update that clears the flag.
 	 */
 	uindexattrs = NULL;
 	pkindexattrs = NULL;
@@ -5404,6 +5442,13 @@ restart:
 		Bitmapset **attrs;
 
 		indexDesc = index_open(indexOid, AccessShareLock);
+
+		/* Skip an index created WITH NO DATA; see above. */
+		if (indexDesc->rd_index->indisnodata)
+		{
+			index_close(indexDesc, AccessShareLock);
+			continue;
+		}
 
 		/*
 		 * Extract index expressions and index predicate.  Note: Don't use
@@ -6545,6 +6590,7 @@ load_relcache_init_file(bool shared)
 		rel->rd_firstRelfilelocatorSubid = InvalidSubTransactionId;
 		rel->rd_droppedSubid = InvalidSubTransactionId;
 		rel->rd_amcache = NULL;
+		rel->rd_toastchunkidtype = InvalidOid;
 		rel->pgstat_info = NULL;
 
 		/*

@@ -374,7 +374,8 @@ extern void vacuum(List *relations, const VacuumParams *params,
 				   BufferAccessStrategy bstrategy, MemoryContext vac_context,
 				   bool isTopLevel);
 extern void vac_open_indexes(Relation relation, LOCKMODE lockmode,
-							 int *nindexes, Relation **Irel);
+							 int *nindexes, Relation **Irel,
+							 bool *hasindex);
 extern void vac_close_indexes(int nindexes, Relation *Irel, LOCKMODE lockmode);
 extern double vac_estimate_reltuples(Relation relation,
 									 BlockNumber total_pages,
@@ -432,6 +433,7 @@ extern void parallel_vacuum_cleanup_all_indexes(ParallelVacuumState *pvs,
 												PVWorkerStats *wstats);
 extern void parallel_vacuum_update_shared_delay_params(void);
 extern void parallel_vacuum_propagate_shared_delay_params(void);
+extern void parallel_vacuum_refresh_cost_params(void);
 extern void parallel_vacuum_main(dsm_segment *seg, shm_toc *toc);
 
 /* in commands/analyze.c */
